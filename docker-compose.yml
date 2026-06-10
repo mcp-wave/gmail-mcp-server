@@ -1,14 +1,32 @@
 version: '3.8'
 
+# Remote (HTTP + OAuth) mode for use as a claude.ai connector.
+# Put your Google "web" OAuth client at ./config/gcp-oauth.keys.json before
+# starting (its redirect URI must be https://YOUR_DOMAIN/oauth2/google/callback).
+# Terminate TLS at a proxy/tunnel in front of this and set BASE_URL to the
+# external https URL. See the "Remote mode (claude.ai connector)" README section.
+#
+# For local stdio use instead, drop `command` and the http-only env vars.
+
 services:
   gmail-mcp:
     build:
       context: .
       dockerfile: Dockerfile
+    command: ["http"]
     volumes:
+      # Persists gcp-oauth.keys.json and the encrypted oauth-store.json.
       - mcp-gmail:/gmail-server
     environment:
-      - GMAIL_CREDENTIALS_PATH=/gmail-server/credentials.json
+      - GMAIL_MCP_CONFIG_DIR=/gmail-server
+      - GMAIL_OAUTH_PATH=/gmail-server/gcp-oauth.keys.json
+      # Public HTTPS URL clients reach this server at (no trailing slash).
+      - BASE_URL=${BASE_URL:?set BASE_URL to your public https URL}
+      # Secret used to encrypt Google refresh tokens at rest. Keep it stable.
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:?set a stable TOKEN_ENCRYPTION_KEY}
+      # Optional: restrict Gmail scopes requested at consent.
+      - GMAIL_MCP_SCOPES=${GMAIL_MCP_SCOPES:-}
+      - PORT=3000
     ports:
       - "3000:3000"
     restart: unless-stopped

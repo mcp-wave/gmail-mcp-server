@@ -55,6 +55,12 @@ interface EmailContent {
 let oauth2Client: OAuth2Client;
 let authorizedScopes: string[] = DEFAULT_SCOPES;
 
+// A per-request session: the Gmail client to use and the scopes it is authorized
+// for. resolveSession turns the transport's request context (`extra`, which
+// carries the validated bearer's AuthInfo in http mode) into one of these.
+export type SessionContext = { gmail: ReturnType<typeof google.gmail>; authorizedScopes: string[] };
+export type ResolveSession = (extra?: any) => Promise<SessionContext> | SessionContext;
+
 /**
  * Recursively extract email body content from MIME message parts
  * Handles complex email structures with nested parts
@@ -253,6 +259,15 @@ async function authenticate(scopes: string[]) {
 
 // Main function
 async function main() {
+    // Remote (claude.ai) multi-tenant mode: loaded lazily so stdio users never
+    // pull in Express / the OAuth stack. It manages its own per-user credentials
+    // and does not use the single local account loaded by loadCredentials().
+    if (process.argv[2] === 'http') {
+        const { startHttpServer } = await import('./http/server.js');
+        startHttpServer(createMcpServer);
+        return;
+    }
+
     await loadCredentials();
 
     if (process.argv[2] === 'auth') {
@@ -284,9 +299,21 @@ async function main() {
         process.exit(0);
     }
 
-    // Initialize Gmail API
+    // stdio mode (default): a single Gmail client bound to the locally
+    // authenticated account; every request resolves to the same session.
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    const server = createMcpServer(() => ({ gmail, authorizedScopes }));
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+}
 
+/**
+ * Builds the MCP Server and registers tool handlers. Each request resolves a
+ * per-call session via resolveSession(extra) — for stdio that is the single
+ * local account; for http (multi-tenant) it is the caller's own Gmail client,
+ * derived from the validated bearer token.
+ */
+function createMcpServer(resolveSession: ResolveSession): Server {
     // Server implementation
     const server = new Server(
         {
@@ -301,16 +328,29 @@ async function main() {
     );
 
     // Tool handlers
-    // Filter available tools based on authorized scopes
-    server.setRequestHandler(ListToolsRequestSchema, async () => {
+    // Filter available tools based on the requesting session's authorized scopes
+    server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => {
+        const { authorizedScopes } = await resolveSession(extra);
         const availableTools = toolDefinitions.filter(tool =>
             hasScope(authorizedScopes, tool.scopes)
         );
         return { tools: toMcpTools(availableTools) };
     });
 
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         const { name, arguments: args } = request.params;
+
+        // Resolve the caller's Gmail client + granted scopes for this request.
+        // In http mode this picks the right tenant; in stdio it is the local account.
+        let gmail: ReturnType<typeof google.gmail>;
+        let authorizedScopes: string[];
+        try {
+            ({ gmail, authorizedScopes } = await resolveSession(extra));
+        } catch (error: any) {
+            return {
+                content: [{ type: "text", text: `Error: ${error.message}` }],
+            };
+        }
 
         // Verify the tool is authorized for the current scopes
         // This guards against direct tool calls that bypass ListTools
@@ -1681,8 +1721,7 @@ async function main() {
         }
     });
 
-    const transport = new StdioServerTransport();
-    server.connect(transport);
+    return server;
 }
 
 main().catch((error) => {

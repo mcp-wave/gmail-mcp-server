@@ -12,9 +12,14 @@
 
 ## Philosophy
 
-This fork is **lean and pragmatic**. It's a local stdio MCP server — you run it on your own machine, and your LLM client already has shell + filesystem access. So the threat model is "don't leak credentials to third parties, don't break the Gmail surface" — not "defend a hosted multi-tenant service". I keep dependencies minimal. I use this daily in my own Claude Code workflow — if I wouldn't run it or maintain it myself, it doesn't go in.
+This fork is **lean and pragmatic**, and it runs in two modes:
 
-There's a downstream fork that took this in the **maximalist** direction. I'm not affiliated with its maintainer and I don't track its security or features — use it at your own risk: **[klodr/gmail-mcp](https://github.com/klodr/gmail-mcp)**. If that's the philosophy you want, go check it out. PRs welcome here as always.
+- **Local (stdio)** — the default. You run it on your own machine; your LLM client already has shell + filesystem access. The threat model is "don't leak credentials to third parties, don't break the Gmail surface." Minimal dependencies, single account, zero network exposure.
+- **Remote (HTTP + OAuth)** — a first-class mode for connecting to [claude.ai](https://claude.ai) (or any MCP client that speaks Streamable HTTP). The server becomes its own OAuth 2.1 authorization server that federates to Google, so each user signs into their **own** Gmail and gets their own isolated session. See [Remote mode (claude.ai connector)](#remote-mode-claudeai-connector).
+
+Remote mode is genuinely multi-tenant, so it carries a real "defend a hosted service" threat model: per-user token isolation, opaque hashed bearer tokens, encrypted-at-rest Google refresh tokens, PKCE, audience binding, and origin checks. If you only need it on your own laptop, stay on stdio — you don't pay for any of that.
+
+I use this daily in my own workflow. If I wouldn't run it or maintain it myself, it doesn't go in. PRs welcome.
 
 ### What this fork adds
 
@@ -222,6 +227,67 @@ node dist/index.js auth https://gmail.gongrzhe.com/oauth2callback
    ```
 
 This approach allows authentication flows to work properly in environments where localhost isn't accessible, such as containerized applications or cloud servers.
+
+## Remote mode (claude.ai connector)
+
+Everything above runs the server **locally over stdio** for a single account. To add Gmail to **[claude.ai](https://claude.ai)** as a custom connector instead, run the server in **remote (HTTP) mode**. It exposes a Streamable HTTP MCP endpoint guarded by OAuth 2.1: the server is its own authorization server and federates each login to Google, so every claude.ai user connects their **own** Gmail.
+
+### How it works
+
+```
+claude.ai ──OAuth (DCR + PKCE)──▶ this server ──OAuth──▶ Google
+          ◀──── opaque bearer ───            ◀── Gmail tokens ──
+```
+
+- claude.ai discovers the server's OAuth metadata, dynamically registers, and runs an authorization-code + PKCE flow against it.
+- The server redirects the user to Google, receives the Gmail grant, and mints its **own** opaque bearer token mapped to that user's Google tokens.
+- Each MCP request is authenticated by that bearer and routed to the caller's own Gmail client.
+
+The server never hands Google's tokens to claude.ai. Google refresh tokens are encrypted at rest; bearer tokens and auth codes are stored hashed.
+
+### 1. Create a Google **Web** OAuth client
+
+Remote mode needs a **Web application** client (not Desktop). In the [Google Cloud Console](https://console.cloud.google.com/) → APIs & Services → Credentials → Create OAuth client ID → **Web application**, add this authorized redirect URI:
+
+```
+https://YOUR_DOMAIN/oauth2/google/callback
+```
+
+Download it as `gcp-oauth.keys.json` and place it in `~/.gmail-mcp/` (or point `GMAIL_OAUTH_PATH` at it). The file must contain a `"web"` block.
+
+### 2. Configure and run
+
+Remote mode requires a **public HTTPS URL** (claude.ai only connects to HTTPS issuers). Terminate TLS at a reverse proxy or tunnel (Cloudflare Tunnel, ngrok, a load balancer, etc.) and point `BASE_URL` at the external HTTPS address.
+
+| Env var | Required | Description |
+|---|---|---|
+| `BASE_URL` | ✅ | Public HTTPS base URL, e.g. `https://gmail.example.com` (no trailing slash, no path). |
+| `TOKEN_ENCRYPTION_KEY` | ✅ | Secret (≥16 chars) used to encrypt Google refresh tokens at rest. Keep it stable across restarts and back it up. |
+| `PORT` | | Port to bind (default `3000`). |
+| `GMAIL_MCP_SCOPES` | | Comma-separated Gmail scopes to request (default `gmail.modify,gmail.settings.basic`). See [OAuth Scopes](#oauth-scopes). |
+| `MCP_ALLOWED_ORIGINS` | | Extra comma-separated `Origin` values allowed to call `/mcp` (for browser-based MCP clients). |
+| `GMAIL_OAUTH_PATH` | | Path to `gcp-oauth.keys.json` if not in `~/.gmail-mcp/`. |
+
+```bash
+npm run build
+BASE_URL=https://gmail.example.com \
+TOKEN_ENCRYPTION_KEY='a-long-random-secret' \
+node dist/index.js http
+```
+
+The server prints its endpoints on startup. Health check: `GET /healthz`.
+
+### 3. Add it to claude.ai
+
+In claude.ai → **Settings → Connectors → Add custom connector**, enter your MCP endpoint:
+
+```
+https://YOUR_DOMAIN/mcp
+```
+
+claude.ai walks the OAuth flow automatically: you'll be sent to Google to sign in and grant access, then dropped back into claude.ai with Gmail connected. Each person who adds the connector authenticates their own mailbox.
+
+> **Security note.** Remote mode is a real multi-tenant service. Run it behind HTTPS, keep `TOKEN_ENCRYPTION_KEY` secret and stable, and treat `~/.gmail-mcp/oauth-store.json` as sensitive (it holds encrypted grants). Token/grant storage is single-process and file-backed; running multiple instances behind a load balancer is not yet supported. If a user revokes access in their Google account, they reconnect the connector to refresh the grant.
 
 ## OAuth Scopes
 

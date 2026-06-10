@@ -20,8 +20,10 @@ ENV NODE_ENV=production
 ENV GMAIL_CREDENTIALS_PATH=/gmail-server/credentials.json
 ENV GMAIL_OAUTH_PATH=/root/.gmail-mcp/gcp-oauth.keys.json
 
-# Expose port for OAuth flow
+# Expose port for the local OAuth callback (stdio mode) and the
+# Streamable HTTP + OAuth endpoint (remote mode: run with `http`).
 EXPOSE 3000
 
-# Set entrypoint command
+# Default entrypoint runs stdio mode; pass `http` (e.g. via compose `command`)
+# to start the remote claude.ai connector.
 ENTRYPOINT ["node", "dist/index.js"]
