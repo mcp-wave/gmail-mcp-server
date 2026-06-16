@@ -61,6 +61,22 @@ let authorizedScopes: string[] = DEFAULT_SCOPES;
 export type SessionContext = { gmail: ReturnType<typeof google.gmail>; authorizedScopes: string[] };
 export type ResolveSession = (extra?: any) => Promise<SessionContext> | SessionContext;
 
+// Draft-first mode (validation/safety gate). When GMAIL_DRAFT_ONLY is truthy the
+// agent cannot send or hard-delete: outbound must go through a draft the user
+// reviews in their Drafts folder, and destructive deletes are withheld. This is
+// the enforced "draft gate" — not a polite request the model can ignore.
+const DRAFT_ONLY = /^(1|true|yes|on)$/i.test(process.env.GMAIL_DRAFT_ONLY || '');
+const DRAFT_ONLY_BLOCKED = new Set([
+    'send_email',
+    'send_draft',
+    'reply_all',
+    'delete_email',
+    'batch_delete_emails',
+]);
+function isToolEnabled(name: string): boolean {
+    return !(DRAFT_ONLY && DRAFT_ONLY_BLOCKED.has(name));
+}
+
 /**
  * Recursively extract email body content from MIME message parts
  * Handles complex email structures with nested parts
@@ -332,7 +348,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
     server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => {
         const { authorizedScopes } = await resolveSession(extra);
         const availableTools = toolDefinitions.filter(tool =>
-            hasScope(authorizedScopes, tool.scopes)
+            hasScope(authorizedScopes, tool.scopes) && isToolEnabled(tool.name)
         );
         return { tools: toMcpTools(availableTools) };
     });
@@ -360,6 +376,14 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                 content: [{
                     type: "text",
                     text: `Error: Tool "${name}" is not available. You may need to re-authenticate with additional scopes.`,
+                }],
+            };
+        }
+        if (!isToolEnabled(name)) {
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error: "${name}" is disabled in draft-first mode. Create or update a draft instead — the user reviews and sends it from their Drafts folder.`,
                 }],
             };
         }
