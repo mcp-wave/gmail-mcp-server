@@ -136,8 +136,10 @@ export class GmailClientCache {
      * Resolve the Gmail client and granted scopes for a user. Throws
      * ReauthRequiredError if the stored grant is missing or has been revoked.
      */
-    getForUser(sub: string): { gmail: CacheEntry['gmail']; scopeNames: string[] } {
-        const record = this.store.getGoogleUser(sub);
+    async getForUser(
+        sub: string,
+    ): Promise<{ gmail: CacheEntry['gmail']; scopeNames: string[] }> {
+        const record = await this.store.getGoogleUser(sub);
         if (!record) throw new ReauthRequiredError();
 
         const key = GmailClientCache.key(sub, record.scopeNames);
@@ -147,7 +149,7 @@ export class GmailClientCache {
             return { gmail: cached.gmail, scopeNames: cached.scopeNames };
         }
 
-        const refreshToken = this.store.getGoogleRefreshToken(sub);
+        const refreshToken = await this.store.getGoogleRefreshToken(sub);
         if (!refreshToken) throw new ReauthRequiredError();
 
         const client = newGoogleClient(this.config);
@@ -178,9 +180,9 @@ export class GmailClientCache {
     }
 
     /** Called when a Gmail API call fails with invalid_grant: clear the dead grant. */
-    handleInvalidGrant(sub: string): void {
+    async handleInvalidGrant(sub: string): Promise<void> {
         this.evict(sub);
-        this.store.deleteGoogleUser(sub);
+        await this.store.deleteGoogleUser(sub);
     }
 }
 

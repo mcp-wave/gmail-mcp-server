@@ -17,7 +17,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { loadHttpConfig, type HttpConfig } from './config.js';
-import { OAuthStore } from './store.js';
+import { createStore } from './store.js';
 import { GmailOAuthProvider } from './provider.js';
 import { GmailClientCache, exchangeGoogleCode, ReauthRequiredError } from './google.js';
 
@@ -44,24 +44,24 @@ function originGuard(config: HttpConfig) {
     };
 }
 
-export function startHttpServer(createMcpServer: McpServerFactory): void {
+export async function startHttpServer(createMcpServer: McpServerFactory): Promise<void> {
     const config = loadHttpConfig();
-    const store = new OAuthStore(config.configDir, config.encryptionKey);
+    const store = await createStore(config);
     const provider = new GmailOAuthProvider(config, store);
     const cache = new GmailClientCache(config, store);
 
-    // Periodic GC of expired tokens / codes / pending auths.
+    // Periodic GC of expired tokens / codes / pending auths (no-op on Firestore).
     const sweep = setInterval(
-        () => store.sweep(config.pendingAuthTtlSec, config.authCodeTtlSec),
+        () => void store.sweep(config.pendingAuthTtlSec, config.authCodeTtlSec),
         5 * 60 * 1000,
     );
     sweep.unref?.();
 
     // Resolve the caller's Gmail client from their bearer token's identity.
-    const resolveSession: ResolveSession = (extra) => {
+    const resolveSession: ResolveSession = async (extra) => {
         const sub = extra?.authInfo?.extra?.googleSub as string | undefined;
         if (!sub) throw new ReauthRequiredError('Missing authentication context.');
-        const { gmail, scopeNames } = cache.getForUser(sub);
+        const { gmail, scopeNames } = await cache.getForUser(sub);
         return { gmail, authorizedScopes: scopeNames };
     };
 

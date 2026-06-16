@@ -1,19 +1,22 @@
 // Persistent OAuth state for the remote (claude.ai) transport.
 //
-// Threat model note: this server is now a multi-tenant credential holder. So:
+// Threat model note: this server is a multi-tenant credential holder. So:
 //   - Opaque tokens and auth codes are stored HASHED (SHA-256), never plaintext —
-//     a leaked store file does not yield usable bearer tokens.
+//     a leaked store does not yield usable bearer tokens.
 //   - Google refresh tokens (long-lived grants to a user's whole mailbox) are
 //     ENCRYPTED at rest (AES-256-GCM) with a key derived from TOKEN_ENCRYPTION_KEY.
 //   - One-time artifacts (auth codes, refresh tokens) are consumed atomically.
 //
-// Storage is single-process, file-backed JSON (see "Out of scope" in the plan:
-// multi-instance shared storage is a follow-up).
+// Two backends implement the OAuthStore interface:
+//   - FileOAuthStore     single-process JSON file (local / stdio dev).
+//   - FirestoreOAuthStore shared, durable, transactional (Cloud Run, multi-instance).
+// Pick via createStore(config).
 
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
+import type { HttpConfig } from './config.js';
 
 const STORE_FILE = 'oauth-store.json';
 const REFRESH_TOKEN_MAX_AGE_SEC = 60 * 60 * 24 * 30; // 30 days
@@ -75,14 +78,44 @@ export interface AuthCodeRecord {
     createdAtSec: number;
 }
 
-interface PersistedShape {
-    clients: Record<string, OAuthClientInformationFull>;
-    googleUsers: Record<string, GoogleUserRecord>;
-    accessTokens: Record<string, AccessTokenRecord>;
-    refreshTokens: Record<string, RefreshTokenRecord>;
+/**
+ * Storage contract for the OAuth authorization server. All methods are async so
+ * a shared backend (Firestore) can implement it; the file backend simply
+ * resolves immediately.
+ */
+export interface OAuthStore {
+    getClient(clientId: string): Promise<OAuthClientInformationFull | undefined>;
+    registerClient(client: OAuthClientInformationFull): Promise<OAuthClientInformationFull>;
+
+    putPendingAuth(record: PendingAuthRecord): Promise<void>;
+    consumePendingAuth(id: string, ttlSec: number): Promise<PendingAuthRecord | undefined>;
+
+    putAuthCode(code: string, record: AuthCodeRecord): Promise<void>;
+    peekAuthCodeChallenge(code: string): Promise<string | undefined>;
+    consumeAuthCode(code: string, ttlSec: number): Promise<AuthCodeRecord | undefined>;
+
+    putAccessToken(token: string, record: AccessTokenRecord): Promise<void>;
+    getAccessToken(token: string): Promise<AccessTokenRecord | undefined>;
+    putRefreshToken(token: string, record: RefreshTokenRecord): Promise<void>;
+    getRefreshToken(token: string): Promise<RefreshTokenRecord | undefined>;
+    markRefreshTokenUsed(token: string): Promise<void>;
+    revokeFamily(familyId: string): Promise<void>;
+
+    getGoogleUser(sub: string): Promise<GoogleUserRecord | undefined>;
+    upsertGoogleUser(
+        sub: string,
+        email: string,
+        refreshToken: string | undefined,
+        scopeNames: string[],
+    ): Promise<void>;
+    getGoogleRefreshToken(sub: string): Promise<string | undefined>;
+    deleteGoogleUser(sub: string): Promise<void>;
+
+    /** Best-effort GC of expired records. May be a no-op when the backend has TTL. */
+    sweep(pendingTtlSec: number, codeTtlSec: number): Promise<void>;
 }
 
-function nowSec(): number {
+export function nowSec(): number {
     return Math.floor(Date.now() / 1000);
 }
 
@@ -94,23 +127,46 @@ export function hashToken(token: string): string {
     return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-export class OAuthStore {
+/** AES-256-GCM encrypt; output is base64(iv | tag | ciphertext). */
+export function encryptSecret(key: Buffer, plaintext: string): string {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return Buffer.concat([iv, tag, ct]).toString('base64');
+}
+
+export function decryptSecret(key: Buffer, payload: string): string {
+    const buf = Buffer.from(payload, 'base64');
+    const iv = buf.subarray(0, 12);
+    const tag = buf.subarray(12, 28);
+    const ct = buf.subarray(28);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
+}
+
+interface PersistedShape {
+    clients: Record<string, OAuthClientInformationFull>;
+    googleUsers: Record<string, GoogleUserRecord>;
+    accessTokens: Record<string, AccessTokenRecord>;
+    refreshTokens: Record<string, RefreshTokenRecord>;
+}
+
+/**
+ * Single-process, file-backed store. Durable across restarts on one machine;
+ * NOT safe for multiple instances (use Firestore for Cloud Run).
+ */
+export class FileOAuthStore implements OAuthStore {
     private readonly filePath: string;
     private readonly key: Buffer;
 
-    // Durable (persisted) state.
     private clients = new Map<string, OAuthClientInformationFull>();
     private googleUsers = new Map<string, GoogleUserRecord>();
     private accessTokens = new Map<string, AccessTokenRecord>();
     private refreshTokens = new Map<string, RefreshTokenRecord>();
-
-    // Ephemeral (in-memory only) short-lived state. Losing these on restart
-    // simply forces an in-flight login to be retried — acceptable.
     private pendingAuths = new Map<string, PendingAuthRecord>();
     private authCodes = new Map<string, AuthCodeRecord>();
-
-    // Serializes per-user Google-token writes to avoid clobbering a rotated
-    // refresh token under concurrent requests (last-write-wins -> logout bug).
     private userWriteLocks = new Map<string, Promise<void>>();
 
     constructor(configDir: string, encryptionKey: Buffer) {
@@ -119,41 +175,15 @@ export class OAuthStore {
         this.load();
     }
 
-    // ---- crypto -----------------------------------------------------------
-
-    encrypt(plaintext: string): string {
-        const iv = crypto.randomBytes(12);
-        const cipher = crypto.createCipheriv('aes-256-gcm', this.key, iv);
-        const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-        const tag = cipher.getAuthTag();
-        return Buffer.concat([iv, tag, ct]).toString('base64');
-    }
-
-    decrypt(payload: string): string {
-        const buf = Buffer.from(payload, 'base64');
-        const iv = buf.subarray(0, 12);
-        const tag = buf.subarray(12, 28);
-        const ct = buf.subarray(28);
-        const decipher = crypto.createDecipheriv('aes-256-gcm', this.key, iv);
-        decipher.setAuthTag(tag);
-        return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
-    }
-
-    // ---- persistence ------------------------------------------------------
-
     private load(): void {
         if (!fs.existsSync(this.filePath)) return;
         try {
-            const data: PersistedShape = JSON.parse(
-                fs.readFileSync(this.filePath, 'utf8'),
-            );
+            const data: PersistedShape = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
             this.clients = new Map(Object.entries(data.clients || {}));
             this.googleUsers = new Map(Object.entries(data.googleUsers || {}));
             this.accessTokens = new Map(Object.entries(data.accessTokens || {}));
             this.refreshTokens = new Map(Object.entries(data.refreshTokens || {}));
         } catch (err) {
-            // A corrupt store should not take the server down; start fresh but
-            // keep the old file aside for inspection.
             console.error('Failed to load OAuth store, starting empty:', err);
         }
     }
@@ -170,26 +200,26 @@ export class OAuthStore {
         fs.renameSync(tmp, this.filePath);
     }
 
-    // ---- clients (DCR) ----------------------------------------------------
-
-    getClient(clientId: string): OAuthClientInformationFull | undefined {
+    async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
         return this.clients.get(clientId);
     }
 
-    registerClient(client: OAuthClientInformationFull): OAuthClientInformationFull {
+    async registerClient(
+        client: OAuthClientInformationFull,
+    ): Promise<OAuthClientInformationFull> {
         this.clients.set(client.client_id, client);
         this.persist();
         return client;
     }
 
-    // ---- pending authorizations (ephemeral) -------------------------------
-
-    putPendingAuth(record: PendingAuthRecord): void {
+    async putPendingAuth(record: PendingAuthRecord): Promise<void> {
         this.pendingAuths.set(record.id, record);
     }
 
-    /** Atomically fetch-and-remove a pending auth (one-time, defends replay). */
-    consumePendingAuth(id: string, ttlSec: number): PendingAuthRecord | undefined {
+    async consumePendingAuth(
+        id: string,
+        ttlSec: number,
+    ): Promise<PendingAuthRecord | undefined> {
         const rec = this.pendingAuths.get(id);
         if (!rec) return undefined;
         this.pendingAuths.delete(id);
@@ -197,19 +227,18 @@ export class OAuthStore {
         return rec;
     }
 
-    // ---- authorization codes (ephemeral, one-time) ------------------------
-
-    putAuthCode(code: string, record: AuthCodeRecord): void {
+    async putAuthCode(code: string, record: AuthCodeRecord): Promise<void> {
         this.authCodes.set(hashToken(code), record);
     }
 
-    /** Read the PKCE challenge for a code without consuming it (SDK calls this first). */
-    peekAuthCodeChallenge(code: string): string | undefined {
+    async peekAuthCodeChallenge(code: string): Promise<string | undefined> {
         return this.authCodes.get(hashToken(code))?.codeChallenge;
     }
 
-    /** Atomically fetch-and-remove an auth code. */
-    consumeAuthCode(code: string, ttlSec: number): AuthCodeRecord | undefined {
+    async consumeAuthCode(
+        code: string,
+        ttlSec: number,
+    ): Promise<AuthCodeRecord | undefined> {
         const h = hashToken(code);
         const rec = this.authCodes.get(h);
         if (!rec) return undefined;
@@ -218,27 +247,25 @@ export class OAuthStore {
         return rec;
     }
 
-    // ---- issued tokens ----------------------------------------------------
-
-    putAccessToken(token: string, record: AccessTokenRecord): void {
+    async putAccessToken(token: string, record: AccessTokenRecord): Promise<void> {
         this.accessTokens.set(hashToken(token), record);
         this.persist();
     }
 
-    getAccessToken(token: string): AccessTokenRecord | undefined {
+    async getAccessToken(token: string): Promise<AccessTokenRecord | undefined> {
         return this.accessTokens.get(hashToken(token));
     }
 
-    putRefreshToken(token: string, record: RefreshTokenRecord): void {
+    async putRefreshToken(token: string, record: RefreshTokenRecord): Promise<void> {
         this.refreshTokens.set(hashToken(token), record);
         this.persist();
     }
 
-    getRefreshToken(token: string): RefreshTokenRecord | undefined {
+    async getRefreshToken(token: string): Promise<RefreshTokenRecord | undefined> {
         return this.refreshTokens.get(hashToken(token));
     }
 
-    markRefreshTokenUsed(token: string): void {
+    async markRefreshTokenUsed(token: string): Promise<void> {
         const rec = this.refreshTokens.get(hashToken(token));
         if (rec) {
             rec.used = true;
@@ -246,8 +273,7 @@ export class OAuthStore {
         }
     }
 
-    /** Revoke an entire token family — used on refresh-token reuse or explicit revoke. */
-    revokeFamily(familyId: string): void {
+    async revokeFamily(familyId: string): Promise<void> {
         for (const [h, rec] of this.accessTokens) {
             if (rec.familyId === familyId) this.accessTokens.delete(h);
         }
@@ -257,17 +283,10 @@ export class OAuthStore {
         this.persist();
     }
 
-    // ---- per-user Google tokens ------------------------------------------
-
-    getGoogleUser(sub: string): GoogleUserRecord | undefined {
+    async getGoogleUser(sub: string): Promise<GoogleUserRecord | undefined> {
         return this.googleUsers.get(sub);
     }
 
-    /**
-     * Upsert a user's Google record, serialized per-sub. The refresh token is
-     * only overwritten when a fresh one is supplied (Google omits it on most
-     * refreshes); passing undefined preserves the stored token.
-     */
     async upsertGoogleUser(
         sub: string,
         email: string,
@@ -278,7 +297,7 @@ export class OAuthStore {
         const next = prev.then(() => {
             const existing = this.googleUsers.get(sub);
             const enc = refreshToken
-                ? this.encrypt(refreshToken)
+                ? encryptSecret(this.key, refreshToken)
                 : existing?.refreshTokenEnc;
             if (!enc) {
                 throw new Error(
@@ -294,7 +313,6 @@ export class OAuthStore {
             });
             this.persist();
         });
-        // Keep the lock chain alive but don't let a rejection poison it.
         this.userWriteLocks.set(
             sub,
             next.catch(() => undefined),
@@ -302,19 +320,16 @@ export class OAuthStore {
         return next;
     }
 
-    getGoogleRefreshToken(sub: string): string | undefined {
+    async getGoogleRefreshToken(sub: string): Promise<string | undefined> {
         const rec = this.googleUsers.get(sub);
-        return rec ? this.decrypt(rec.refreshTokenEnc) : undefined;
+        return rec ? decryptSecret(this.key, rec.refreshTokenEnc) : undefined;
     }
 
-    deleteGoogleUser(sub: string): void {
+    async deleteGoogleUser(sub: string): Promise<void> {
         if (this.googleUsers.delete(sub)) this.persist();
     }
 
-    // ---- garbage collection ----------------------------------------------
-
-    /** Drop expired access tokens, stale refresh tokens, and timed-out ephemeral state. */
-    sweep(pendingTtlSec: number, codeTtlSec: number): void {
+    async sweep(pendingTtlSec: number, codeTtlSec: number): Promise<void> {
         const now = nowSec();
         let dirty = false;
         for (const [h, rec] of this.accessTokens) {
@@ -337,4 +352,18 @@ export class OAuthStore {
         }
         if (dirty) this.persist();
     }
+}
+
+export { REFRESH_TOKEN_MAX_AGE_SEC };
+
+/**
+ * Build the configured store. Firestore is loaded lazily so the file/stdio path
+ * never pulls in the (heavy) Firestore client library.
+ */
+export async function createStore(config: HttpConfig): Promise<OAuthStore> {
+    if (config.storeBackend === 'firestore') {
+        const { FirestoreOAuthStore } = await import('./firestore-store.js');
+        return new FirestoreOAuthStore(config);
+    }
+    return new FileOAuthStore(config.configDir, config.encryptionKey);
 }

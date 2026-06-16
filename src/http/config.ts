@@ -40,7 +40,13 @@ export interface HttpConfig {
     googleScopeUrls: string[];
     /** MCP-level scope advertised to claude.ai (kept distinct from Google scopes). */
     mcpScope: string;
-    /** Directory where the OAuth store persists its JSON. */
+    /** Which storage backend the OAuth store uses. */
+    storeBackend: 'file' | 'firestore';
+    /** Firestore database id (firestore backend only). */
+    firestoreDatabaseId: string;
+    /** GCP project id for Firestore; auto-detected on Cloud Run if unset. */
+    gcpProject?: string;
+    /** Directory where the file-backed OAuth store persists its JSON. */
     configDir: string;
     /** 32-byte key (derived) for AES-256-GCM encryption of Google refresh tokens at rest. */
     encryptionKey: Buffer;
@@ -159,7 +165,21 @@ export function loadHttpConfig(): HttpConfig {
         throw new Error(`PORT is not a number: ${process.env.PORT}`);
     }
 
+    // Default to Firestore when running on Cloud Run (K_SERVICE is set there),
+    // otherwise the local file store. Override explicitly with STORE_BACKEND.
+    const storeBackendEnv = (process.env.STORE_BACKEND || '').toLowerCase();
+    const storeBackend: 'file' | 'firestore' =
+        storeBackendEnv === 'firestore' || storeBackendEnv === 'file'
+            ? (storeBackendEnv as 'file' | 'firestore')
+            : process.env.K_SERVICE
+              ? 'firestore'
+              : 'file';
+
     return {
+        storeBackend,
+        firestoreDatabaseId: process.env.FIRESTORE_DATABASE_ID || '(default)',
+        gcpProject:
+            process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT || undefined,
         baseUrl: baseUrlRaw,
         issuerUrl,
         resourceUrl: `${baseUrlRaw}/mcp`,

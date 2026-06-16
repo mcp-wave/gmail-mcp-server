@@ -21,7 +21,8 @@ import type {
     OAuthTokenRevocationRequest,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HttpConfig } from './config.js';
-import { OAuthStore, generateToken } from './store.js';
+import { generateToken } from './store.js';
+import type { OAuthStore } from './store.js';
 import { buildGoogleAuthUrl, type GoogleIdentity } from './google.js';
 
 function nowSec(): number {
@@ -63,7 +64,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         // (it is the OAuth `state` we send to Google). Stored server-side; the
         // claude redirect_uri here was already validated by the SDK.
         const pendingId = generateToken();
-        this.store.putPendingAuth({
+        await this.store.putPendingAuth({
             id: pendingId,
             clientId: client.client_id,
             redirectUri: params.redirectUri,
@@ -85,7 +86,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         pendingId: string,
         identity: GoogleIdentity,
     ): Promise<{ redirectUri: string; code: string; state?: string }> {
-        const pending = this.store.consumePendingAuth(
+        const pending = await this.store.consumePendingAuth(
             pendingId,
             this.config.pendingAuthTtlSec,
         );
@@ -103,7 +104,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         );
 
         const code = generateToken();
-        this.store.putAuthCode(code, {
+        await this.store.putAuthCode(code, {
             clientId: pending.clientId,
             redirectUri: pending.redirectUri,
             codeChallenge: pending.codeChallenge,
@@ -120,7 +121,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         _client: OAuthClientInformationFull,
         authorizationCode: string,
     ): Promise<string> {
-        const challenge = this.store.peekAuthCodeChallenge(authorizationCode);
+        const challenge = await this.store.peekAuthCodeChallenge(authorizationCode);
         if (challenge === undefined) {
             throw new InvalidGrantError('Invalid or expired authorization code');
         }
@@ -134,7 +135,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         redirectUri?: string,
         resource?: URL,
     ): Promise<OAuthTokens> {
-        const rec = this.store.consumeAuthCode(
+        const rec = await this.store.consumeAuthCode(
             authorizationCode,
             this.config.authCodeTtlSec,
         );
@@ -157,7 +158,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         _scopes?: string[],
         resource?: URL,
     ): Promise<OAuthTokens> {
-        const rec = this.store.getRefreshToken(refreshToken);
+        const rec = await this.store.getRefreshToken(refreshToken);
         if (!rec) throw new InvalidGrantError('Invalid refresh token');
         if (rec.clientId !== client.client_id) {
             throw new InvalidGrantError('Refresh token was issued to another client');
@@ -165,18 +166,18 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         if (rec.used) {
             // Reuse of a rotated refresh token is the canonical theft signal:
             // burn the whole family.
-            this.store.revokeFamily(rec.familyId);
+            await this.store.revokeFamily(rec.familyId);
             throw new InvalidGrantError('Refresh token reuse detected; session revoked');
         }
         if (resource && canonical(resource.href) !== rec.resource) {
             throw new InvalidTargetError('resource does not match the original grant');
         }
-        this.store.markRefreshTokenUsed(refreshToken);
+        await this.store.markRefreshTokenUsed(refreshToken);
         return this.issueTokens(rec.clientId, rec.googleSub, rec.mcpScope, rec.resource, rec.familyId);
     }
 
     async verifyAccessToken(token: string): Promise<AuthInfo> {
-        const rec = this.store.getAccessToken(token);
+        const rec = await this.store.getAccessToken(token);
         if (!rec) throw new InvalidTokenError('Invalid access token');
         if (rec.expiresAtSec <= nowSec()) throw new InvalidTokenError('Access token expired');
         // Audience binding (RFC 8707) — the SDK does NOT enforce this for us.
@@ -198,23 +199,22 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         request: OAuthTokenRevocationRequest,
     ): Promise<void> {
         const token = request.token;
-        const family =
-            this.store.getAccessToken(token)?.familyId ??
-            this.store.getRefreshToken(token)?.familyId;
-        if (family) this.store.revokeFamily(family);
+        const at = await this.store.getAccessToken(token);
+        const family = at?.familyId ?? (await this.store.getRefreshToken(token))?.familyId;
+        if (family) await this.store.revokeFamily(family);
     }
 
-    private issueTokens(
+    private async issueTokens(
         clientId: string,
         googleSub: string,
         mcpScope: string,
         resource: string,
         familyId: string,
-    ): OAuthTokens {
+    ): Promise<OAuthTokens> {
         const accessToken = generateToken();
         const refreshToken = generateToken();
         const expiresAtSec = nowSec() + this.config.accessTokenTtlSec;
-        this.store.putAccessToken(accessToken, {
+        await this.store.putAccessToken(accessToken, {
             clientId,
             googleSub,
             mcpScope,
@@ -222,7 +222,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
             familyId,
             expiresAtSec,
         });
-        this.store.putRefreshToken(refreshToken, {
+        await this.store.putRefreshToken(refreshToken, {
             clientId,
             googleSub,
             mcpScope,

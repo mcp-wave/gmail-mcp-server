@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { GmailOAuthProvider } from './provider.js';
-import { OAuthStore } from './store.js';
+import { FileOAuthStore } from './store.js';
 import type { HttpConfig } from './config.js';
 import type { GoogleIdentity } from './google.js';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
@@ -64,11 +64,11 @@ function runAuthorize(provider: GmailOAuthProvider): Promise<string> {
 
 describe('GmailOAuthProvider full flow', () => {
     let dir: string;
-    let store: OAuthStore;
+    let store: FileOAuthStore;
     let provider: GmailOAuthProvider;
     beforeEach(() => {
         dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gmail-mcp-prov-'));
-        store = new OAuthStore(dir, crypto.randomBytes(32));
+        store = new FileOAuthStore(dir, crypto.randomBytes(32));
         provider = new GmailOAuthProvider(makeConfig(dir), store);
     });
     afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -99,7 +99,7 @@ describe('GmailOAuthProvider full flow', () => {
         expect(auth.expiresAt).toBeLessThan(Math.floor(Date.now() / 1000) + 3700);
 
         // The Google grant was persisted for this user.
-        expect(store.getGoogleRefreshToken('google-sub-1')).toBe('google-refresh-token');
+        expect(await store.getGoogleRefreshToken('google-sub-1')).toBe('google-refresh-token');
     });
 
     it('rejects a replayed authorization code', async () => {
