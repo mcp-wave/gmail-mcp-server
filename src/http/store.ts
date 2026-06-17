@@ -47,6 +47,28 @@ export interface PrincipalRecord {
 /** Short-lived ticket binding an account-link sign-in to an existing principal. */
 export interface LinkTicketRecord {
     principalId: string;
+    /** Set when the link was started from the manage page; return there after. */
+    authRequestId?: string;
+    createdAtSec: number;
+}
+
+/** A browser session (cookie) identifying a returning principal at /authorize. */
+export interface SessionRecord {
+    principalId: string;
+    createdAtSec: number;
+}
+
+/**
+ * A claude.ai authorization request parked while the user manages accounts on the
+ * manage page. Finalized (exchanged for our auth code) when they click Continue.
+ */
+export interface AuthRequestRecord {
+    clientId: string;
+    redirectUri: string;
+    codeChallenge: string;
+    state?: string;
+    resource: string;
+    mcpScope: string;
     createdAtSec: number;
 }
 
@@ -138,6 +160,14 @@ export interface OAuthStore {
     putLinkTicket(ticket: string, record: LinkTicketRecord): Promise<void>;
     consumeLinkTicket(ticket: string, ttlSec: number): Promise<LinkTicketRecord | undefined>;
 
+    putSession(sessionId: string, record: SessionRecord): Promise<void>;
+    getSession(sessionId: string, ttlSec: number): Promise<SessionRecord | undefined>;
+    deleteSession(sessionId: string): Promise<void>;
+
+    putAuthRequest(id: string, record: AuthRequestRecord): Promise<void>;
+    getAuthRequest(id: string, ttlSec: number): Promise<AuthRequestRecord | undefined>;
+    consumeAuthRequest(id: string, ttlSec: number): Promise<AuthRequestRecord | undefined>;
+
     /** Best-effort GC of expired records. May be a no-op when the backend has TTL. */
     sweep(pendingTtlSec: number, codeTtlSec: number): Promise<void>;
 }
@@ -177,6 +207,7 @@ interface PersistedShape {
     clients: Record<string, OAuthClientInformationFull>;
     googleUsers: Record<string, GoogleUserRecord>;
     principals: Record<string, PrincipalRecord>;
+    sessions: Record<string, SessionRecord>;
     accessTokens: Record<string, AccessTokenRecord>;
     refreshTokens: Record<string, RefreshTokenRecord>;
 }
@@ -194,9 +225,11 @@ export class FileOAuthStore implements OAuthStore {
     private principals = new Map<string, PrincipalRecord>();
     private accessTokens = new Map<string, AccessTokenRecord>();
     private refreshTokens = new Map<string, RefreshTokenRecord>();
+    private sessions = new Map<string, SessionRecord>();
     private pendingAuths = new Map<string, PendingAuthRecord>();
     private authCodes = new Map<string, AuthCodeRecord>();
     private linkTickets = new Map<string, LinkTicketRecord>();
+    private authRequests = new Map<string, AuthRequestRecord>();
     private userWriteLocks = new Map<string, Promise<void>>();
 
     constructor(configDir: string, encryptionKey: Buffer) {
@@ -212,6 +245,7 @@ export class FileOAuthStore implements OAuthStore {
             this.clients = new Map(Object.entries(data.clients || {}));
             this.googleUsers = new Map(Object.entries(data.googleUsers || {}));
             this.principals = new Map(Object.entries(data.principals || {}));
+            this.sessions = new Map(Object.entries(data.sessions || {}));
             this.accessTokens = new Map(Object.entries(data.accessTokens || {}));
             this.refreshTokens = new Map(Object.entries(data.refreshTokens || {}));
         } catch (err) {
@@ -224,6 +258,7 @@ export class FileOAuthStore implements OAuthStore {
             clients: Object.fromEntries(this.clients),
             googleUsers: Object.fromEntries(this.googleUsers),
             principals: Object.fromEntries(this.principals),
+            sessions: Object.fromEntries(this.sessions),
             accessTokens: Object.fromEntries(this.accessTokens),
             refreshTokens: Object.fromEntries(this.refreshTokens),
         };
@@ -407,6 +442,41 @@ export class FileOAuthStore implements OAuthStore {
         const rec = this.linkTickets.get(h);
         if (!rec) return undefined;
         this.linkTickets.delete(h);
+        if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
+        return rec;
+    }
+
+    async putSession(sessionId: string, record: SessionRecord): Promise<void> {
+        this.sessions.set(hashToken(sessionId), record);
+        this.persist();
+    }
+
+    async getSession(sessionId: string, ttlSec: number): Promise<SessionRecord | undefined> {
+        const rec = this.sessions.get(hashToken(sessionId));
+        if (!rec) return undefined;
+        if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
+        return rec;
+    }
+
+    async deleteSession(sessionId: string): Promise<void> {
+        if (this.sessions.delete(hashToken(sessionId))) this.persist();
+    }
+
+    async putAuthRequest(id: string, record: AuthRequestRecord): Promise<void> {
+        this.authRequests.set(id, record);
+    }
+
+    async getAuthRequest(id: string, ttlSec: number): Promise<AuthRequestRecord | undefined> {
+        const rec = this.authRequests.get(id);
+        if (!rec) return undefined;
+        if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
+        return rec;
+    }
+
+    async consumeAuthRequest(id: string, ttlSec: number): Promise<AuthRequestRecord | undefined> {
+        const rec = this.authRequests.get(id);
+        if (!rec) return undefined;
+        this.authRequests.delete(id);
         if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
         return rec;
     }

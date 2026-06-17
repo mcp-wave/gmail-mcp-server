@@ -14,6 +14,8 @@ import {
     type GoogleUserRecord,
     type PrincipalRecord,
     type LinkTicketRecord,
+    type SessionRecord,
+    type AuthRequestRecord,
     type AccessTokenRecord,
     type RefreshTokenRecord,
     type PendingAuthRecord,
@@ -25,6 +27,8 @@ import {
     nowSec,
 } from './store.js';
 
+const SESSION_MAX_AGE_SEC = 60 * 60 * 24 * 30; // 30 days
+
 const C = {
     clients: 'oauth_clients',
     pendingAuths: 'oauth_pending_auths',
@@ -34,6 +38,8 @@ const C = {
     googleUsers: 'oauth_google_users',
     principals: 'oauth_principals',
     linkTickets: 'oauth_link_tickets',
+    sessions: 'oauth_sessions',
+    authRequests: 'oauth_auth_requests',
 } as const;
 
 function ttl(sec: number): Timestamp {
@@ -283,6 +289,56 @@ export class FirestoreOAuthStore implements OAuthStore {
             const rec = snap.data() as DocumentData;
             if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
             return stripMeta(rec) as LinkTicketRecord;
+        });
+    }
+
+    // ---- browser sessions -------------------------------------------------
+
+    async putSession(sessionId: string, record: SessionRecord): Promise<void> {
+        await this.db
+            .collection(C.sessions)
+            .doc(hashToken(sessionId))
+            .set({ ...record, expireAt: ttl(SESSION_MAX_AGE_SEC) });
+    }
+
+    async getSession(sessionId: string, ttlSec: number): Promise<SessionRecord | undefined> {
+        const snap = await this.db.collection(C.sessions).doc(hashToken(sessionId)).get();
+        if (!snap.exists) return undefined;
+        const rec = snap.data() as DocumentData;
+        if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
+        return stripMeta(rec) as SessionRecord;
+    }
+
+    async deleteSession(sessionId: string): Promise<void> {
+        await this.db.collection(C.sessions).doc(hashToken(sessionId)).delete();
+    }
+
+    // ---- parked authorize requests (manage flow) --------------------------
+
+    async putAuthRequest(id: string, record: AuthRequestRecord): Promise<void> {
+        await this.db
+            .collection(C.authRequests)
+            .doc(id)
+            .set({ ...record, expireAt: ttl(60 * 60) });
+    }
+
+    async getAuthRequest(id: string, ttlSec: number): Promise<AuthRequestRecord | undefined> {
+        const snap = await this.db.collection(C.authRequests).doc(id).get();
+        if (!snap.exists) return undefined;
+        const rec = snap.data() as DocumentData;
+        if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
+        return stripMeta(rec) as AuthRequestRecord;
+    }
+
+    async consumeAuthRequest(id: string, ttlSec: number): Promise<AuthRequestRecord | undefined> {
+        const ref = this.db.collection(C.authRequests).doc(id);
+        return this.db.runTransaction(async (tx) => {
+            const snap = await tx.get(ref);
+            if (!snap.exists) return undefined;
+            tx.delete(ref);
+            const rec = snap.data() as DocumentData;
+            if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
+            return stripMeta(rec) as AuthRequestRecord;
         });
     }
 

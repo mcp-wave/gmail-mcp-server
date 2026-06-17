@@ -177,7 +177,7 @@ describe('GmailOAuthProvider full flow', () => {
 
         // Link account B via a one-time ticket (as the /link callback would).
         const ticket = await provider.createLinkTicket(principalId);
-        expect(await provider.consumeLinkTicket(ticket)).toBe(principalId);
+        expect((await provider.consumeLinkTicket(ticket))?.principalId).toBe(principalId);
         expect(await provider.consumeLinkTicket(ticket)).toBeUndefined(); // one-time
 
         const ACCOUNT_B: GoogleIdentity = {
@@ -194,6 +194,36 @@ describe('GmailOAuthProvider full flow', () => {
         expect(await store.getGoogleRefreshToken('google-sub-2')).toBe('google-refresh-token-B');
         // The linked account points back at the same principal.
         expect((await store.getGoogleUser('google-sub-2'))?.principalId).toBe(principalId);
+    });
+
+    it('a returning session routes /authorize to the manage page; Continue issues a code', async () => {
+        // Establish a principal and a browser session.
+        const principalId = await provider.ensurePrincipal(IDENTITY);
+        const sessionId = await provider.createSession(principalId);
+
+        // /authorize with the session cookie present → redirect to the manage page.
+        let captured = '';
+        const res = {
+            redirect: (u: string) => { captured = u; },
+            req: { headers: { cookie: `mcp_session=${sessionId}` } },
+        } as any;
+        await provider.authorize(CLIENT, {
+            state: 'cs', scopes: ['gmail'], redirectUri: CLIENT.redirect_uris[0],
+            codeChallenge: CHALLENGE, resource: new URL(RESOURCE),
+        }, res);
+        expect(captured).toContain('/manage?req=');
+        const reqId = new URL(captured).searchParams.get('req')!;
+
+        // "Continue" finalizes: mints a code bound to the principal + original request.
+        const { redirectUri, code, state } = await provider.finalizeAuthorization(reqId, principalId);
+        expect(redirectUri).toBe(CLIENT.redirect_uris[0]);
+        expect(state).toBe('cs');
+
+        const tokens = await provider.exchangeAuthorizationCode(
+            CLIENT, code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE),
+        );
+        const auth = await provider.verifyAccessToken(tokens.access_token);
+        expect((auth.extra as any).principalId).toBe(principalId);
     });
 
     it('reuses the existing principal when the same primary reconnects', async () => {

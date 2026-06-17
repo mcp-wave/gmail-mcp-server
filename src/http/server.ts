@@ -21,6 +21,7 @@ import { createStore } from './store.js';
 import { GmailOAuthProvider } from './provider.js';
 import { GmailClientCache, exchangeGoogleCode, buildGoogleAuthUrl, ReauthRequiredError } from './google.js';
 import type { OAuthStore } from './store.js';
+import { SESSION_COOKIE, readSessionCookie } from './cookies.js';
 import type { PrincipalSession, Account, ResolveSession } from '../session.js';
 
 /** What each tool call needs: a Gmail client + the caller's granted scopes. */
@@ -90,18 +91,24 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
         try {
             const identity = await exchangeGoogleCode(config, code);
 
-            // Linking flow: `state` is a one-time link ticket bound to a principal.
-            // (A primary-connect `state` is a pendingAuthId, which won't match here
-            // and falls through to completeGoogleAuth.)
-            const linkPrincipalId = await provider.consumeLinkTicket(state);
-            if (linkPrincipalId) {
-                await provider.linkGoogleAccount(linkPrincipalId, identity);
+            // Linking flow: `state` is a one-time link ticket bound to a principal
+            // (from the in-chat tool or the manage page's "Add account"). A
+            // primary-connect `state` is a pendingAuthId, which won't match here
+            // and falls through to completeGoogleAuth.
+            const ticket = await provider.consumeLinkTicket(state);
+            if (ticket) {
+                await provider.linkGoogleAccount(ticket.principalId, identity);
+                if (ticket.authRequestId) {
+                    res.redirect(`${config.baseUrl}/manage?req=${encodeURIComponent(ticket.authRequestId)}`);
+                    return;
+                }
                 res.status(200).send(linkedAccountPage(identity.email));
                 return;
             }
 
-            const { redirectUri, code: ourCode, state: claudeState } =
+            const { redirectUri, code: ourCode, state: claudeState, sessionId } =
                 await provider.completeGoogleAuth(state, identity);
+            setSessionCookie(res, sessionId, config);
             const dest = new URL(redirectUri);
             dest.searchParams.set('code', ourCode);
             if (claudeState) dest.searchParams.set('state', claudeState);
@@ -123,6 +130,79 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
             return;
         }
         res.redirect(buildGoogleAuthUrl(config, ticket, true));
+    });
+
+    // --- Account management surface (shown during (re)connect) -------------
+    const form = express.urlencoded({ extended: false });
+
+    const sessionPrincipal = async (req: Request): Promise<string | undefined> => {
+        const sid = readSessionCookie(req);
+        const sess = sid ? await store.getSession(sid, config.sessionTtlSec) : undefined;
+        return sess?.principalId;
+    };
+
+    // Manage page: list linked accounts with Add / Remove, and Continue to finish.
+    app.get('/manage', async (req: Request, res: Response) => {
+        const reqId = req.query.req as string | undefined;
+        if (!reqId || !(await store.getAuthRequest(reqId, config.authRequestTtlSec))) {
+            res.status(400).send('This authorization request has expired. Please reconnect from your client.');
+            return;
+        }
+        const principalId = await sessionPrincipal(req);
+        if (!principalId) {
+            res.status(401).send('Your session expired. Please reconnect from your client.');
+            return;
+        }
+        res.status(200).send(managePage(reqId, await listPrincipalAccounts(store, principalId)));
+    });
+
+    // Add account: start a Google sign-in (account chooser) bound to this request.
+    app.get('/manage/add', async (req: Request, res: Response) => {
+        const reqId = req.query.req as string | undefined;
+        const principalId = await sessionPrincipal(req);
+        if (!reqId || !principalId) {
+            res.status(400).send('Invalid request. Please reconnect from your client.');
+            return;
+        }
+        const ticket = await provider.createLinkTicket(principalId, reqId);
+        res.redirect(buildGoogleAuthUrl(config, ticket, true));
+    });
+
+    // Remove a linked account (cannot remove the primary).
+    app.post('/manage/remove', form, async (req: Request, res: Response) => {
+        const reqId = req.body?.req as string | undefined;
+        const sub = req.body?.sub as string | undefined;
+        const principalId = await sessionPrincipal(req);
+        if (!reqId || !sub || !principalId) {
+            res.status(400).send('Invalid request.');
+            return;
+        }
+        const principal = await store.getPrincipal(principalId);
+        if (principal && sub !== principal.primarySub && principal.accountSubs.includes(sub)) {
+            await store.removeAccountFromPrincipal(principalId, sub);
+            await store.deleteGoogleUser(sub);
+            cache.evict(sub);
+        }
+        res.redirect(`/manage?req=${encodeURIComponent(reqId)}`);
+    });
+
+    // Continue: finish the connection — issue our auth code back to the client.
+    app.post('/manage/continue', form, async (req: Request, res: Response) => {
+        const reqId = req.body?.req as string | undefined;
+        const principalId = await sessionPrincipal(req);
+        if (!reqId || !principalId) {
+            res.status(400).send('Invalid request. Please reconnect from your client.');
+            return;
+        }
+        try {
+            const { redirectUri, code, state } = await provider.finalizeAuthorization(reqId, principalId);
+            const dest = new URL(redirectUri);
+            dest.searchParams.set('code', code);
+            if (state) dest.searchParams.set('state', state);
+            res.redirect(dest.toString());
+        } catch (err: any) {
+            res.status(400).send('Could not complete the connection. Please reconnect from your client.');
+        }
     });
 
     const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(
@@ -212,6 +292,60 @@ function linkedAccountPage(email: string): string {
 <body style="font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center">
 <h2>✓ ${escapeHtml(email)} linked</h2>
 <p>This mailbox is now available to your assistant. You can close this window and return to your chat.</p>
+</body></html>`;
+}
+
+function setSessionCookie(res: Response, sessionId: string, config: HttpConfig): void {
+    res.cookie(SESSION_COOKIE, sessionId, {
+        httpOnly: true,
+        secure: config.issuerUrl.protocol === 'https:',
+        sameSite: 'lax',
+        path: '/',
+        maxAge: config.sessionTtlSec * 1000,
+    });
+}
+
+/** Lightweight account list for the manage page (no Gmail clients built). */
+async function listPrincipalAccounts(
+    store: OAuthStore,
+    principalId: string,
+): Promise<Array<{ sub: string; email: string; primary: boolean }>> {
+    const principal = await store.getPrincipal(principalId);
+    if (!principal) return [];
+    const out: Array<{ sub: string; email: string; primary: boolean }> = [];
+    for (const sub of principal.accountSubs) {
+        const user = await store.getGoogleUser(sub);
+        out.push({ sub, email: user?.email || sub, primary: sub === principal.primarySub });
+    }
+    return out;
+}
+
+function managePage(
+    reqId: string,
+    accounts: Array<{ sub: string; email: string; primary: boolean }>,
+): string {
+    const r = escapeHtml(reqId);
+    const rows = accounts
+        .map((a) => {
+            const remove = a.primary
+                ? '<span style="color:#999">primary</span>'
+                : `<form method="post" action="/manage/remove" style="margin:0">
+<input type="hidden" name="req" value="${r}"><input type="hidden" name="sub" value="${escapeHtml(a.sub)}">
+<button type="submit" style="color:#b00;background:none;border:1px solid #b00;border-radius:6px;padding:.2rem .6rem;cursor:pointer">Remove</button></form>`;
+            return `<li style="display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.6rem 0;border-bottom:1px solid #eee">
+<span>${escapeHtml(a.email)}</span>${remove}</li>`;
+        })
+        .join('');
+    return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect Gmail</title></head>
+<body style="font-family:system-ui;max-width:34rem;margin:3rem auto;padding:0 1rem">
+<h2>Connect your mailboxes</h2>
+<p style="color:#555">Link one or more Gmail accounts to this connection. Your assistant will work across all of them.</p>
+<ul style="list-style:none;padding:0">${rows}</ul>
+<p><a href="/manage/add?req=${r}" style="display:inline-block;margin:.5rem 0;padding:.5rem 1rem;border:1px solid #1a73e8;color:#1a73e8;border-radius:8px;text-decoration:none">+ Add another account</a></p>
+<form method="post" action="/manage/continue" style="margin-top:1.5rem">
+<input type="hidden" name="req" value="${r}">
+<button type="submit" style="background:#1a73e8;color:#fff;border:none;border-radius:8px;padding:.7rem 1.4rem;font-size:1rem;cursor:pointer">Continue</button>
+</form>
 </body></html>`;
 }
 

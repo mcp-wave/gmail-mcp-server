@@ -24,6 +24,7 @@ import type { HttpConfig } from './config.js';
 import { generateToken } from './store.js';
 import type { OAuthStore } from './store.js';
 import { buildGoogleAuthUrl, type GoogleIdentity } from './google.js';
+import { readSessionCookie } from './cookies.js';
 
 function nowSec(): number {
     return Math.floor(Date.now() / 1000);
@@ -60,6 +61,30 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         params: AuthorizationParams,
         res: Response,
     ): Promise<void> {
+        // If the browser already has a session, send them to the manage page so
+        // they can add/remove mailboxes before finishing — the connector's auth
+        // surface doubles as the account hub. Otherwise (first connect), log in
+        // with Google directly.
+        const sessionId = readSessionCookie((res as any).req);
+        const session = sessionId
+            ? await this.store.getSession(sessionId, this.config.sessionTtlSec)
+            : undefined;
+
+        if (session) {
+            const reqId = generateToken();
+            await this.store.putAuthRequest(reqId, {
+                clientId: client.client_id,
+                redirectUri: params.redirectUri,
+                codeChallenge: params.codeChallenge,
+                state: params.state,
+                resource: params.resource ? canonical(params.resource.href) : this.resource,
+                mcpScope: this.config.mcpScope,
+                createdAtSec: nowSec(),
+            });
+            res.redirect(`${this.config.baseUrl}/manage?req=${encodeURIComponent(reqId)}`);
+            return;
+        }
+
         // High-entropy, one-time id ties Google's callback back to this request
         // (it is the OAuth `state` we send to Google). Stored server-side; the
         // claude redirect_uri here was already validated by the SDK.
@@ -85,7 +110,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
     async completeGoogleAuth(
         pendingId: string,
         identity: GoogleIdentity,
-    ): Promise<{ redirectUri: string; code: string; state?: string }> {
+    ): Promise<{ redirectUri: string; code: string; state?: string; sessionId: string }> {
         const pending = await this.store.consumePendingAuth(
             pendingId,
             this.config.pendingAuthTtlSec,
@@ -130,20 +155,73 @@ export class GmailOAuthProvider implements OAuthServerProvider {
             createdAtSec: nowSec(),
         });
 
-        return { redirectUri: pending.redirectUri, code, state: pending.state };
+        // Establish a browser session so a return visit to /authorize lands on the
+        // account-management page instead of a fresh login.
+        const sessionId = await this.createSession(principalId);
+
+        return { redirectUri: pending.redirectUri, code, state: pending.state, sessionId };
     }
 
-    /** Create a one-time ticket that links a new Google account to a principal. */
-    async createLinkTicket(principalId: string): Promise<string> {
+    /** Mint a browser session for a principal; returns the raw session id (cookie value). */
+    async createSession(principalId: string): Promise<string> {
+        const sessionId = generateToken();
+        await this.store.putSession(sessionId, { principalId, createdAtSec: nowSec() });
+        return sessionId;
+    }
+
+    /** Find-or-create the principal owning a freshly-authorized Google account. */
+    async ensurePrincipal(identity: GoogleIdentity): Promise<string> {
+        await this.store.upsertGoogleUser(
+            identity.sub, identity.email, identity.refreshToken, identity.scopeNames,
+        );
+        const existing = await this.store.getGoogleUser(identity.sub);
+        let principalId = existing?.principalId;
+        if (!principalId) {
+            principalId = generateToken();
+            await this.store.createPrincipal({
+                id: principalId,
+                primarySub: identity.sub,
+                accountSubs: [identity.sub],
+                createdAt: nowSec(),
+            });
+            await this.store.setUserPrincipal(identity.sub, principalId);
+        }
+        return principalId;
+    }
+
+    /** Create a one-time ticket for an account-link sign-in. */
+    async createLinkTicket(principalId: string, authRequestId?: string): Promise<string> {
         const ticket = generateToken();
-        await this.store.putLinkTicket(ticket, { principalId, createdAtSec: nowSec() });
+        await this.store.putLinkTicket(ticket, { principalId, authRequestId, createdAtSec: nowSec() });
         return ticket;
     }
 
-    /** Resolve a link ticket (Google `state` during a link flow) to its principal. */
-    async consumeLinkTicket(ticket: string): Promise<string | undefined> {
-        const rec = await this.store.consumeLinkTicket(ticket, this.config.pendingAuthTtlSec);
-        return rec?.principalId;
+    /** Resolve+consume a link ticket (Google `state` during a link flow). */
+    async consumeLinkTicket(ticket: string) {
+        return this.store.consumeLinkTicket(ticket, this.config.pendingAuthTtlSec);
+    }
+
+    /**
+     * Finalize a parked authorize request (manage-page "Continue"): mint our auth
+     * code bound to the principal and the original claude.ai request parameters.
+     */
+    async finalizeAuthorization(
+        authRequestId: string,
+        principalId: string,
+    ): Promise<{ redirectUri: string; code: string; state?: string }> {
+        const ar = await this.store.consumeAuthRequest(authRequestId, this.config.authRequestTtlSec);
+        if (!ar) throw new InvalidGrantError('Authorization request expired; please reconnect.');
+        const code = generateToken();
+        await this.store.putAuthCode(code, {
+            clientId: ar.clientId,
+            redirectUri: ar.redirectUri,
+            codeChallenge: ar.codeChallenge,
+            mcpScope: ar.mcpScope,
+            resource: ar.resource,
+            principalId,
+            createdAtSec: nowSec(),
+        });
+        return { redirectUri: ar.redirectUri, code, state: ar.state };
     }
 
     /** Attach a newly-authorized Google account to an existing principal. */
