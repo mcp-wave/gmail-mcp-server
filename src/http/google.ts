@@ -46,10 +46,16 @@ function grantedGmailScopeNames(scopeString: string | null | undefined): string[
  * force the consent screen so Google reliably returns a refresh token (identity is
  * unknown at this point, so we cannot skip consent for already-enrolled users).
  */
-export function buildGoogleAuthUrl(config: HttpConfig, state: string): string {
+export function buildGoogleAuthUrl(
+    config: HttpConfig,
+    state: string,
+    selectAccount = false,
+): string {
     return newGoogleClient(config).generateAuthUrl({
         access_type: 'offline',
-        prompt: 'consent',
+        // For linking, force the account chooser so the user can pick a DIFFERENT
+        // mailbox than the one they're already signed into.
+        prompt: selectAccount ? 'consent select_account' : 'consent',
         scope: ['openid', 'email', ...config.googleScopeUrls],
         state,
     });

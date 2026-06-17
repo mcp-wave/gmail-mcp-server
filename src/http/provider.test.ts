@@ -93,7 +93,12 @@ describe('GmailOAuthProvider full flow', () => {
         const auth = await provider.verifyAccessToken(tokens.access_token);
         expect(auth.clientId).toBe('claude-client');
         expect(auth.scopes).toEqual(['gmail']);
-        expect((auth.extra as any).googleSub).toBe('google-sub-1');
+        // Token binds to a PRINCIPAL; the principal owns the primary account.
+        const principalId = (auth.extra as any).principalId as string;
+        expect(principalId).toBeTruthy();
+        const principal = await store.getPrincipal(principalId);
+        expect(principal?.primarySub).toBe('google-sub-1');
+        expect(principal?.accountSubs).toEqual(['google-sub-1']);
         // expiresAt must be seconds-since-epoch in the near future (bearerAuth requires this).
         expect(auth.expiresAt).toBeGreaterThan(Math.floor(Date.now() / 1000));
         expect(auth.expiresAt).toBeLessThan(Math.floor(Date.now() / 1000) + 3700);
@@ -158,6 +163,51 @@ describe('GmailOAuthProvider full flow', () => {
 
         // Family revoked: the rotated access token no longer verifies.
         await expect(provider.verifyAccessToken(rotated.access_token)).rejects.toThrow();
+    });
+
+    it('links a second account to the same principal (one-time ticket)', async () => {
+        // Primary connect → principal owns account A.
+        const pendingId = await runAuthorize(provider);
+        const { code } = await provider.completeGoogleAuth(pendingId, IDENTITY);
+        const tokens = await provider.exchangeAuthorizationCode(
+            CLIENT, code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE),
+        );
+        const principalId = (await provider.verifyAccessToken(tokens.access_token)).extra!
+            .principalId as string;
+
+        // Link account B via a one-time ticket (as the /link callback would).
+        const ticket = await provider.createLinkTicket(principalId);
+        expect(await provider.consumeLinkTicket(ticket)).toBe(principalId);
+        expect(await provider.consumeLinkTicket(ticket)).toBeUndefined(); // one-time
+
+        const ACCOUNT_B: GoogleIdentity = {
+            sub: 'google-sub-2',
+            email: 'work@example.com',
+            refreshToken: 'google-refresh-token-B',
+            scopeNames: ['gmail.modify'],
+        };
+        await provider.linkGoogleAccount(principalId, ACCOUNT_B);
+
+        const principal = await store.getPrincipal(principalId);
+        expect(principal?.primarySub).toBe('google-sub-1');
+        expect(principal?.accountSubs.sort()).toEqual(['google-sub-1', 'google-sub-2']);
+        expect(await store.getGoogleRefreshToken('google-sub-2')).toBe('google-refresh-token-B');
+        // The linked account points back at the same principal.
+        expect((await store.getGoogleUser('google-sub-2'))?.principalId).toBe(principalId);
+    });
+
+    it('reuses the existing principal when the same primary reconnects', async () => {
+        const p1 = await runAuthorize(provider);
+        const c1 = (await provider.completeGoogleAuth(p1, IDENTITY)).code;
+        const t1 = await provider.exchangeAuthorizationCode(CLIENT, c1, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
+        const pid1 = (await provider.verifyAccessToken(t1.access_token)).extra!.principalId;
+
+        const p2 = await runAuthorize(provider);
+        const c2 = (await provider.completeGoogleAuth(p2, IDENTITY)).code;
+        const t2 = await provider.exchangeAuthorizationCode(CLIENT, c2, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
+        const pid2 = (await provider.verifyAccessToken(t2.access_token)).extra!.principalId;
+
+        expect(pid2).toBe(pid1); // same Google primary → same principal
     });
 
     it('rejects a refresh token issued to a different client', async () => {

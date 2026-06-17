@@ -103,6 +103,22 @@ export class GmailOAuthProvider implements OAuthServerProvider {
             identity.scopeNames,
         );
 
+        // Find-or-create the principal this primary account belongs to. The token
+        // we ultimately mint is bound to the PRINCIPAL, not the single account,
+        // so additional mailboxes can be linked under the same connection.
+        const existing = await this.store.getGoogleUser(identity.sub);
+        let principalId = existing?.principalId;
+        if (!principalId) {
+            principalId = generateToken();
+            await this.store.createPrincipal({
+                id: principalId,
+                primarySub: identity.sub,
+                accountSubs: [identity.sub],
+                createdAt: nowSec(),
+            });
+            await this.store.setUserPrincipal(identity.sub, principalId);
+        }
+
         const code = generateToken();
         await this.store.putAuthCode(code, {
             clientId: pending.clientId,
@@ -110,11 +126,36 @@ export class GmailOAuthProvider implements OAuthServerProvider {
             codeChallenge: pending.codeChallenge,
             mcpScope: pending.mcpScope,
             resource: pending.resource,
-            googleSub: identity.sub,
+            principalId,
             createdAtSec: nowSec(),
         });
 
         return { redirectUri: pending.redirectUri, code, state: pending.state };
+    }
+
+    /** Create a one-time ticket that links a new Google account to a principal. */
+    async createLinkTicket(principalId: string): Promise<string> {
+        const ticket = generateToken();
+        await this.store.putLinkTicket(ticket, { principalId, createdAtSec: nowSec() });
+        return ticket;
+    }
+
+    /** Resolve a link ticket (Google `state` during a link flow) to its principal. */
+    async consumeLinkTicket(ticket: string): Promise<string | undefined> {
+        const rec = await this.store.consumeLinkTicket(ticket, this.config.pendingAuthTtlSec);
+        return rec?.principalId;
+    }
+
+    /** Attach a newly-authorized Google account to an existing principal. */
+    async linkGoogleAccount(principalId: string, identity: GoogleIdentity): Promise<void> {
+        await this.store.upsertGoogleUser(
+            identity.sub,
+            identity.email,
+            identity.refreshToken,
+            identity.scopeNames,
+        );
+        await this.store.setUserPrincipal(identity.sub, principalId);
+        await this.store.addAccountToPrincipal(principalId, identity.sub);
     }
 
     async challengeForAuthorizationCode(
@@ -149,7 +190,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         if (resource && canonical(resource.href) !== rec.resource) {
             throw new InvalidTargetError('resource does not match the authorization request');
         }
-        return this.issueTokens(rec.clientId, rec.googleSub, rec.mcpScope, rec.resource, generateToken());
+        return this.issueTokens(rec.clientId, rec.principalId, rec.mcpScope, rec.resource, generateToken());
     }
 
     async exchangeRefreshToken(
@@ -173,7 +214,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
             throw new InvalidTargetError('resource does not match the original grant');
         }
         await this.store.markRefreshTokenUsed(refreshToken);
-        return this.issueTokens(rec.clientId, rec.googleSub, rec.mcpScope, rec.resource, rec.familyId);
+        return this.issueTokens(rec.clientId, rec.principalId, rec.mcpScope, rec.resource, rec.familyId);
     }
 
     async verifyAccessToken(token: string): Promise<AuthInfo> {
@@ -190,7 +231,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
             scopes: [rec.mcpScope],
             expiresAt: rec.expiresAtSec, // seconds since epoch — required by bearerAuth
             resource: new URL(rec.resource),
-            extra: { googleSub: rec.googleSub },
+            extra: { principalId: rec.principalId },
         };
     }
 
@@ -206,7 +247,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
 
     private async issueTokens(
         clientId: string,
-        googleSub: string,
+        principalId: string,
         mcpScope: string,
         resource: string,
         familyId: string,
@@ -216,7 +257,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         const expiresAtSec = nowSec() + this.config.accessTokenTtlSec;
         await this.store.putAccessToken(accessToken, {
             clientId,
-            googleSub,
+            principalId,
             mcpScope,
             resource,
             familyId,
@@ -224,7 +265,7 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         });
         await this.store.putRefreshToken(refreshToken, {
             clientId,
-            googleSub,
+            principalId,
             mcpScope,
             resource,
             familyId,

@@ -19,17 +19,11 @@ import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { loadHttpConfig, type HttpConfig } from './config.js';
 import { createStore } from './store.js';
 import { GmailOAuthProvider } from './provider.js';
-import { GmailClientCache, exchangeGoogleCode, ReauthRequiredError } from './google.js';
+import { GmailClientCache, exchangeGoogleCode, buildGoogleAuthUrl, ReauthRequiredError } from './google.js';
+import type { OAuthStore } from './store.js';
+import type { PrincipalSession, Account, ResolveSession } from '../session.js';
 
 /** What each tool call needs: a Gmail client + the caller's granted scopes. */
-export interface Session {
-    gmail: any;
-    authorizedScopes: string[];
-}
-
-/** Resolves the per-request session from the validated bearer token. */
-export type ResolveSession = (extra: any) => Promise<Session> | Session;
-
 /** Builds the MCP Server with all tool handlers (implemented in index.ts). */
 export type McpServerFactory = (resolve: ResolveSession) => Server;
 
@@ -57,12 +51,12 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
     );
     sweep.unref?.();
 
-    // Resolve the caller's Gmail client from their bearer token's identity.
+    // Resolve the caller's principal (and all its linked Gmail accounts) from the
+    // bearer token. Clients are pre-resolved so getClient() can be synchronous.
     const resolveSession: ResolveSession = async (extra) => {
-        const sub = extra?.authInfo?.extra?.googleSub as string | undefined;
-        if (!sub) throw new ReauthRequiredError('Missing authentication context.');
-        const { gmail, scopeNames } = await cache.getForUser(sub);
-        return { gmail, authorizedScopes: scopeNames };
+        const principalId = extra?.authInfo?.extra?.principalId as string | undefined;
+        if (!principalId) throw new ReauthRequiredError('Missing authentication context.');
+        return buildPrincipalSession(config, store, cache, provider, principalId);
     };
 
     const app = express();
@@ -95,6 +89,17 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
         }
         try {
             const identity = await exchangeGoogleCode(config, code);
+
+            // Linking flow: `state` is a one-time link ticket bound to a principal.
+            // (A primary-connect `state` is a pendingAuthId, which won't match here
+            // and falls through to completeGoogleAuth.)
+            const linkPrincipalId = await provider.consumeLinkTicket(state);
+            if (linkPrincipalId) {
+                await provider.linkGoogleAccount(linkPrincipalId, identity);
+                res.status(200).send(linkedAccountPage(identity.email));
+                return;
+            }
+
             const { redirectUri, code: ourCode, state: claudeState } =
                 await provider.completeGoogleAuth(state, identity);
             const dest = new URL(redirectUri);
@@ -106,6 +111,18 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
             console.error('Google callback error:', err?.message || err);
             res.status(400).send('Authorization could not be completed. Please try connecting again.');
         }
+    });
+
+    // Start an account-link flow: redirect to Google with the link ticket as
+    // state and the account chooser forced. The ticket is validated (consumed)
+    // back at /oauth2/google/callback.
+    app.get('/link/start', (req: Request, res: Response) => {
+        const ticket = req.query.ticket as string | undefined;
+        if (!ticket) {
+            res.status(400).send('Missing link ticket.');
+            return;
+        }
+        res.redirect(buildGoogleAuthUrl(config, ticket, true));
     });
 
     const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(
@@ -182,4 +199,72 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
 
 function sanitize(s: string): string {
     return s.replace(/[^a-zA-Z0-9_\- ]/g, '').slice(0, 100);
+}
+
+function escapeHtml(s: string): string {
+    return s.replace(/[&<>"']/g, (c) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string),
+    );
+}
+
+function linkedAccountPage(email: string): string {
+    return `<!doctype html><html><head><meta charset="utf-8"><title>Account linked</title></head>
+<body style="font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center">
+<h2>✓ ${escapeHtml(email)} linked</h2>
+<p>This mailbox is now available to your assistant. You can close this window and return to your chat.</p>
+</body></html>`;
+}
+
+/**
+ * Build the per-request principal session: load the principal, pre-resolve a
+ * Gmail client for each linked account (so getClient is synchronous), and expose
+ * link/unlink operations. Dead grants on secondary accounts are skipped; a dead
+ * primary surfaces as a re-auth error.
+ */
+async function buildPrincipalSession(
+    config: HttpConfig,
+    store: OAuthStore,
+    cache: GmailClientCache,
+    provider: GmailOAuthProvider,
+    principalId: string,
+): Promise<PrincipalSession> {
+    const principal = await store.getPrincipal(principalId);
+    if (!principal) throw new ReauthRequiredError('Connection not found. Please reconnect.');
+
+    const clients = new Map<string, { gmail: any; authorizedScopes: string[] }>();
+    const accounts: Account[] = [];
+
+    for (const sub of principal.accountSubs) {
+        const user = await store.getGoogleUser(sub);
+        if (!user) continue;
+        const isPrimary = sub === principal.primarySub;
+        try {
+            const { gmail, scopeNames } = await cache.getForUser(sub);
+            clients.set(sub, { gmail, authorizedScopes: scopeNames });
+            accounts.push({ sub, email: user.email, primary: isPrimary, scopeNames });
+        } catch (err) {
+            // Secondary with a dead grant: skip it. Dead primary: fail the session.
+            if (isPrimary) throw err;
+        }
+    }
+    if (accounts.length === 0) throw new ReauthRequiredError('No active mailbox. Please reconnect.');
+
+    return {
+        principalId,
+        accounts,
+        getClient: (sub: string) => {
+            const c = clients.get(sub);
+            if (!c) throw new ReauthRequiredError('Mailbox unavailable. Please reconnect that account.');
+            return c;
+        },
+        linkAccount: async () => {
+            const ticket = await provider.createLinkTicket(principalId);
+            return `${config.baseUrl}/link/start?ticket=${encodeURIComponent(ticket)}`;
+        },
+        unlinkAccount: async (sub: string) => {
+            await store.removeAccountFromPrincipal(principalId, sub);
+            await store.deleteGoogleUser(sub);
+            cache.evict(sub);
+        },
+    };
 }

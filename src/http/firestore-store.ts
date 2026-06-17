@@ -12,6 +12,8 @@ import type { HttpConfig } from './config.js';
 import {
     type OAuthStore,
     type GoogleUserRecord,
+    type PrincipalRecord,
+    type LinkTicketRecord,
     type AccessTokenRecord,
     type RefreshTokenRecord,
     type PendingAuthRecord,
@@ -30,6 +32,8 @@ const C = {
     accessTokens: 'oauth_access_tokens',
     refreshTokens: 'oauth_refresh_tokens',
     googleUsers: 'oauth_google_users',
+    principals: 'oauth_principals',
+    linkTickets: 'oauth_link_tickets',
 } as const;
 
 function ttl(sec: number): Timestamp {
@@ -201,6 +205,9 @@ export class FirestoreOAuthStore implements OAuthStore {
                 email,
                 refreshTokenEnc: enc,
                 scopeNames,
+                // Preserve the principal back-reference (ignoreUndefinedProperties
+                // drops it when there's no existing record yet).
+                principalId: existing?.principalId,
                 updatedAt: nowSec(),
             });
         });
@@ -213,6 +220,70 @@ export class FirestoreOAuthStore implements OAuthStore {
 
     async deleteGoogleUser(sub: string): Promise<void> {
         await this.db.collection(C.googleUsers).doc(sub).delete();
+    }
+
+    async setUserPrincipal(sub: string, principalId: string): Promise<void> {
+        await this.db
+            .collection(C.googleUsers)
+            .doc(sub)
+            .set({ principalId }, { merge: true });
+    }
+
+    // ---- principals -------------------------------------------------------
+
+    async getPrincipal(principalId: string): Promise<PrincipalRecord | undefined> {
+        const snap = await this.db.collection(C.principals).doc(principalId).get();
+        return snap.exists ? (stripMeta(snap.data()!) as PrincipalRecord) : undefined;
+    }
+
+    async createPrincipal(record: PrincipalRecord): Promise<void> {
+        await this.db.collection(C.principals).doc(record.id).set(record);
+    }
+
+    async addAccountToPrincipal(principalId: string, sub: string): Promise<void> {
+        const ref = this.db.collection(C.principals).doc(principalId);
+        await this.db.runTransaction(async (tx) => {
+            const snap = await tx.get(ref);
+            if (!snap.exists) return;
+            const p = snap.data() as PrincipalRecord;
+            if (!p.accountSubs.includes(sub)) {
+                tx.update(ref, { accountSubs: [...p.accountSubs, sub] });
+            }
+        });
+    }
+
+    async removeAccountFromPrincipal(principalId: string, sub: string): Promise<void> {
+        const ref = this.db.collection(C.principals).doc(principalId);
+        await this.db.runTransaction(async (tx) => {
+            const snap = await tx.get(ref);
+            if (!snap.exists) return;
+            const p = snap.data() as PrincipalRecord;
+            tx.update(ref, { accountSubs: p.accountSubs.filter((s) => s !== sub) });
+        });
+    }
+
+    // ---- link tickets (one-time) ------------------------------------------
+
+    async putLinkTicket(ticket: string, record: LinkTicketRecord): Promise<void> {
+        await this.db
+            .collection(C.linkTickets)
+            .doc(hashToken(ticket))
+            .set({ ...record, expireAt: ttl(60 * 60) });
+    }
+
+    async consumeLinkTicket(
+        ticket: string,
+        ttlSec: number,
+    ): Promise<LinkTicketRecord | undefined> {
+        const ref = this.db.collection(C.linkTickets).doc(hashToken(ticket));
+        return this.db.runTransaction(async (tx) => {
+            const snap = await tx.get(ref);
+            if (!snap.exists) return undefined;
+            tx.delete(ref);
+            const rec = snap.data() as DocumentData;
+            if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
+            return stripMeta(rec) as LinkTicketRecord;
+        });
     }
 
     // ---- GC ---------------------------------------------------------------

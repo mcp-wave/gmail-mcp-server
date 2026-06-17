@@ -29,12 +29,30 @@ export interface GoogleUserRecord {
     refreshTokenEnc: string;
     /** Gmail scopes (shorthand) the user actually granted. */
     scopeNames: string[];
+    /** The principal this account belongs to (back-reference). */
+    principalId?: string;
     updatedAt: number;
+}
+
+/** A principal = one claude.ai connection, owning one or more Google accounts. */
+export interface PrincipalRecord {
+    id: string;
+    /** The account used to first connect; cannot be unlinked. */
+    primarySub: string;
+    /** All linked account subs (includes primarySub). */
+    accountSubs: string[];
+    createdAt: number;
+}
+
+/** Short-lived ticket binding an account-link sign-in to an existing principal. */
+export interface LinkTicketRecord {
+    principalId: string;
+    createdAtSec: number;
 }
 
 export interface AccessTokenRecord {
     clientId: string;
-    googleSub: string;
+    principalId: string;
     mcpScope: string;
     /** Bound audience (RFC 8707). Enforced at verify time. */
     resource: string;
@@ -44,7 +62,7 @@ export interface AccessTokenRecord {
 
 export interface RefreshTokenRecord {
     clientId: string;
-    googleSub: string;
+    principalId: string;
     mcpScope: string;
     resource: string;
     familyId: string;
@@ -74,7 +92,7 @@ export interface AuthCodeRecord {
     codeChallenge: string;
     mcpScope: string;
     resource: string;
-    googleSub: string;
+    principalId: string;
     createdAtSec: number;
 }
 
@@ -110,6 +128,15 @@ export interface OAuthStore {
     ): Promise<void>;
     getGoogleRefreshToken(sub: string): Promise<string | undefined>;
     deleteGoogleUser(sub: string): Promise<void>;
+    setUserPrincipal(sub: string, principalId: string): Promise<void>;
+
+    getPrincipal(principalId: string): Promise<PrincipalRecord | undefined>;
+    createPrincipal(record: PrincipalRecord): Promise<void>;
+    addAccountToPrincipal(principalId: string, sub: string): Promise<void>;
+    removeAccountFromPrincipal(principalId: string, sub: string): Promise<void>;
+
+    putLinkTicket(ticket: string, record: LinkTicketRecord): Promise<void>;
+    consumeLinkTicket(ticket: string, ttlSec: number): Promise<LinkTicketRecord | undefined>;
 
     /** Best-effort GC of expired records. May be a no-op when the backend has TTL. */
     sweep(pendingTtlSec: number, codeTtlSec: number): Promise<void>;
@@ -149,6 +176,7 @@ export function decryptSecret(key: Buffer, payload: string): string {
 interface PersistedShape {
     clients: Record<string, OAuthClientInformationFull>;
     googleUsers: Record<string, GoogleUserRecord>;
+    principals: Record<string, PrincipalRecord>;
     accessTokens: Record<string, AccessTokenRecord>;
     refreshTokens: Record<string, RefreshTokenRecord>;
 }
@@ -163,10 +191,12 @@ export class FileOAuthStore implements OAuthStore {
 
     private clients = new Map<string, OAuthClientInformationFull>();
     private googleUsers = new Map<string, GoogleUserRecord>();
+    private principals = new Map<string, PrincipalRecord>();
     private accessTokens = new Map<string, AccessTokenRecord>();
     private refreshTokens = new Map<string, RefreshTokenRecord>();
     private pendingAuths = new Map<string, PendingAuthRecord>();
     private authCodes = new Map<string, AuthCodeRecord>();
+    private linkTickets = new Map<string, LinkTicketRecord>();
     private userWriteLocks = new Map<string, Promise<void>>();
 
     constructor(configDir: string, encryptionKey: Buffer) {
@@ -181,6 +211,7 @@ export class FileOAuthStore implements OAuthStore {
             const data: PersistedShape = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
             this.clients = new Map(Object.entries(data.clients || {}));
             this.googleUsers = new Map(Object.entries(data.googleUsers || {}));
+            this.principals = new Map(Object.entries(data.principals || {}));
             this.accessTokens = new Map(Object.entries(data.accessTokens || {}));
             this.refreshTokens = new Map(Object.entries(data.refreshTokens || {}));
         } catch (err) {
@@ -192,6 +223,7 @@ export class FileOAuthStore implements OAuthStore {
         const data: PersistedShape = {
             clients: Object.fromEntries(this.clients),
             googleUsers: Object.fromEntries(this.googleUsers),
+            principals: Object.fromEntries(this.principals),
             accessTokens: Object.fromEntries(this.accessTokens),
             refreshTokens: Object.fromEntries(this.refreshTokens),
         };
@@ -309,6 +341,7 @@ export class FileOAuthStore implements OAuthStore {
                 email,
                 refreshTokenEnc: enc,
                 scopeNames,
+                principalId: existing?.principalId, // preserve the back-reference
                 updatedAt: nowSec(),
             });
             this.persist();
@@ -327,6 +360,55 @@ export class FileOAuthStore implements OAuthStore {
 
     async deleteGoogleUser(sub: string): Promise<void> {
         if (this.googleUsers.delete(sub)) this.persist();
+    }
+
+    async setUserPrincipal(sub: string, principalId: string): Promise<void> {
+        const rec = this.googleUsers.get(sub);
+        if (rec) {
+            rec.principalId = principalId;
+            this.persist();
+        }
+    }
+
+    async getPrincipal(principalId: string): Promise<PrincipalRecord | undefined> {
+        return this.principals.get(principalId);
+    }
+
+    async createPrincipal(record: PrincipalRecord): Promise<void> {
+        this.principals.set(record.id, record);
+        this.persist();
+    }
+
+    async addAccountToPrincipal(principalId: string, sub: string): Promise<void> {
+        const p = this.principals.get(principalId);
+        if (p && !p.accountSubs.includes(sub)) {
+            p.accountSubs.push(sub);
+            this.persist();
+        }
+    }
+
+    async removeAccountFromPrincipal(principalId: string, sub: string): Promise<void> {
+        const p = this.principals.get(principalId);
+        if (p) {
+            p.accountSubs = p.accountSubs.filter((s) => s !== sub);
+            this.persist();
+        }
+    }
+
+    async putLinkTicket(ticket: string, record: LinkTicketRecord): Promise<void> {
+        this.linkTickets.set(hashToken(ticket), record);
+    }
+
+    async consumeLinkTicket(
+        ticket: string,
+        ttlSec: number,
+    ): Promise<LinkTicketRecord | undefined> {
+        const h = hashToken(ticket);
+        const rec = this.linkTickets.get(h);
+        if (!rec) return undefined;
+        this.linkTickets.delete(h);
+        if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
+        return rec;
     }
 
     async sweep(pendingTtlSec: number, codeTtlSec: number): Promise<void> {
@@ -349,6 +431,9 @@ export class FileOAuthStore implements OAuthStore {
         }
         for (const [h, rec] of this.authCodes) {
             if (now - rec.createdAtSec > codeTtlSec) this.authCodes.delete(h);
+        }
+        for (const [h, rec] of this.linkTickets) {
+            if (now - rec.createdAtSec > pendingTtlSec) this.linkTickets.delete(h);
         }
         if (dirty) this.persist();
     }

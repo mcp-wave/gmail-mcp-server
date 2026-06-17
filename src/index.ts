@@ -21,6 +21,7 @@ import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader
 import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
 import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
+import type { Account, PrincipalSession, ResolveSession } from "./session.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -58,8 +59,104 @@ let authorizedScopes: string[] = DEFAULT_SCOPES;
 // A per-request session: the Gmail client to use and the scopes it is authorized
 // for. resolveSession turns the transport's request context (`extra`, which
 // carries the validated bearer's AuthInfo in http mode) into one of these.
-export type SessionContext = { gmail: ReturnType<typeof google.gmail>; authorizedScopes: string[] };
-export type ResolveSession = (extra?: any) => Promise<SessionContext> | SessionContext;
+// Tools that mutate a mailbox require an explicit `account` when more than one is
+// linked (the agent must never cross-write by accident). Everything not listed is
+// a read and fans out across all linked accounts by default.
+const WRITE_TOOLS = new Set([
+    'send_email', 'draft_email', 'send_draft', 'delete_draft', 'update_draft',
+    'modify_email', 'delete_email', 'batch_modify_emails', 'report_phishing',
+    'batch_report_phishing', 'batch_delete_emails', 'create_label', 'update_label',
+    'delete_label', 'get_or_create_label', 'create_filter', 'delete_filter',
+    'create_filter_from_template', 'reply_all', 'modify_thread',
+]);
+
+const errText = (text: string) => ({ content: [{ type: 'text', text }] });
+
+function unionScopes(accounts: Account[]): string[] {
+    const s = new Set<string>();
+    for (const a of accounts) for (const sc of a.scopeNames) s.add(sc);
+    return [...s];
+}
+
+function findAccount(session: PrincipalSession, selector: string): Account | undefined {
+    const sel = String(selector).trim().toLowerCase();
+    if (sel === 'primary') return session.accounts.find(a => a.primary) || session.accounts[0];
+    return session.accounts.find(a => a.email.toLowerCase() === sel || a.sub === selector);
+}
+
+function stripAccount(args: any): any {
+    if (!args || typeof args !== 'object') return args;
+    const { account, ...rest } = args;
+    void account;
+    return rest;
+}
+
+// Prepend an account header so multi-account read results are always attributable.
+function annotate(email: string, primary: boolean, result: any): any {
+    const header = { type: 'text', text: `=== ${email}${primary ? ' (primary)' : ''} ===` };
+    return { ...result, content: [header, ...(result?.content || [])] };
+}
+
+// `account` parameter injected into every Gmail tool's schema so the agent knows
+// it can target a mailbox (and must, for writes, when multiple are linked).
+const ACCOUNT_PARAM = {
+    account: {
+        type: 'string',
+        description:
+            'Which linked mailbox (email address) to act on. Reads: omit to search ALL linked accounts (results are labeled by account). Writes: required when more than one account is linked.',
+    },
+};
+
+function metaToolDefs(session: PrincipalSession): any[] {
+    const tools: any[] = [{
+        name: 'list_accounts',
+        description: 'List the Gmail accounts linked to this connection (email and which is primary).',
+        inputSchema: { type: 'object', properties: {} },
+    }];
+    if (session.linkAccount) {
+        tools.push({
+            name: 'link_account',
+            description: 'Link an additional Gmail account. Returns a sign-in link the user opens to authorize the new mailbox; afterwards it is available to all email tools.',
+            inputSchema: { type: 'object', properties: {} },
+        });
+        tools.push({
+            name: 'unlink_account',
+            description: 'Unlink a previously linked Gmail account by email address.',
+            inputSchema: { type: 'object', properties: { account: { type: 'string', description: 'Email address of the account to unlink.' } }, required: ['account'] },
+        });
+    }
+    return tools;
+}
+
+async function metaListAccounts(session: PrincipalSession) {
+    const lines = session.accounts.map(
+        a => `- ${a.email}${a.primary ? ' (primary)' : ''}`,
+    );
+    return errText(`Linked accounts (${session.accounts.length}):\n${lines.join('\n')}`);
+}
+
+async function metaLinkAccount(session: PrincipalSession) {
+    if (!session.linkAccount) {
+        return errText('Linking additional accounts is only available on the hosted server.');
+    }
+    const url = await session.linkAccount();
+    return errText(
+        `To link another Gmail account, open this link and sign in with the account you want to add:\n${url}\n\nAfter you authorize, it becomes available to all email tools.`,
+    );
+}
+
+async function metaUnlinkAccount(session: PrincipalSession, args: any) {
+    if (!session.unlinkAccount) {
+        return errText('Unlinking is only available on the hosted server.');
+    }
+    const acct = args?.account ? findAccount(session, args.account) : undefined;
+    if (!acct) {
+        return errText(`Specify which account to unlink. Linked: ${session.accounts.map(a => a.email).join(', ')}`);
+    }
+    if (acct.primary) return errText('Cannot unlink the primary account.');
+    await session.unlinkAccount(acct.sub);
+    return errText(`Unlinked ${acct.email}.`);
+}
 
 // Draft-first mode (validation/safety gate). When GMAIL_DRAFT_ONLY is truthy the
 // agent cannot send or hard-delete: outbound must go through a draft the user
@@ -280,7 +377,7 @@ async function main() {
     // and does not use the single local account loaded by loadCredentials().
     if (process.argv[2] === 'http') {
         const { startHttpServer } = await import('./http/server.js');
-        startHttpServer(createMcpServer);
+        await startHttpServer(createMcpServer);
         return;
     }
 
@@ -316,9 +413,14 @@ async function main() {
     }
 
     // stdio mode (default): a single Gmail client bound to the locally
-    // authenticated account; every request resolves to the same session.
+    // authenticated account, surfaced as a one-account principal.
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-    const server = createMcpServer(() => ({ gmail, authorizedScopes }));
+    const stdioSession: PrincipalSession = {
+        principalId: 'local',
+        accounts: [{ sub: 'local', email: 'me', primary: true, scopeNames: authorizedScopes }],
+        getClient: () => ({ gmail, authorizedScopes }),
+    };
+    const server = createMcpServer(() => stdioSession);
     const transport = new StdioServerTransport();
     await server.connect(transport);
 }
@@ -346,48 +448,31 @@ function createMcpServer(resolveSession: ResolveSession): Server {
     // Tool handlers
     // Filter available tools based on the requesting session's authorized scopes
     server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => {
-        const { authorizedScopes } = await resolveSession(extra);
+        const session = await resolveSession(extra);
+        const scopes = unionScopes(session.accounts);
         const availableTools = toolDefinitions.filter(tool =>
-            hasScope(authorizedScopes, tool.scopes) && isToolEnabled(tool.name)
+            hasScope(scopes, tool.scopes) && isToolEnabled(tool.name)
         );
-        return { tools: toMcpTools(availableTools) };
+        // Advertise the `account` selector on every Gmail tool, then append the
+        // account-management meta tools.
+        const gmailTools = toMcpTools(availableTools).map((t: any) => ({
+            ...t,
+            inputSchema: {
+                ...t.inputSchema,
+                properties: { ...(t.inputSchema?.properties || {}), ...ACCOUNT_PARAM },
+            },
+        }));
+        return { tools: [...gmailTools, ...metaToolDefs(session)] };
     });
 
-    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-        const { name, arguments: args } = request.params;
-
-        // Resolve the caller's Gmail client + granted scopes for this request.
-        // In http mode this picks the right tenant; in stdio it is the local account.
-        let gmail: ReturnType<typeof google.gmail>;
-        let authorizedScopes: string[];
-        try {
-            ({ gmail, authorizedScopes } = await resolveSession(extra));
-        } catch (error: any) {
-            return {
-                content: [{ type: "text", text: `Error: ${error.message}` }],
-            };
-        }
-
-        // Verify the tool is authorized for the current scopes
-        // This guards against direct tool calls that bypass ListTools
-        const toolDef = getToolByName(name);
-        if (!toolDef || !hasScope(authorizedScopes, toolDef.scopes)) {
-            return {
-                content: [{
-                    type: "text",
-                    text: `Error: Tool "${name}" is not available. You may need to re-authenticate with additional scopes.`,
-                }],
-            };
-        }
-        if (!isToolEnabled(name)) {
-            return {
-                content: [{
-                    type: "text",
-                    text: `Error: "${name}" is disabled in draft-first mode. Create or update a draft instead — the user reviews and sends it from their Drafts folder.`,
-                }],
-            };
-        }
-
+    // Runs a single tool against ONE resolved Gmail client. The CallTool handler
+    // below orchestrates account selection and fan-out, then calls this per account.
+    async function executeTool(
+        name: string,
+        args: any,
+        gmail: ReturnType<typeof google.gmail>,
+        authorizedScopes: string[],
+    ): Promise<any> {
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
             let message: string;
 
@@ -1743,6 +1828,79 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                 ],
             };
         }
+    }
+
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+        const { name, arguments: rawArgs } = request.params;
+        const args: any = rawArgs || {};
+
+        let session: PrincipalSession;
+        try {
+            session = await resolveSession(extra);
+        } catch (error: any) {
+            return errText(`Error: ${error.message}`);
+        }
+
+        // Account-management meta tools (no per-account Gmail client needed).
+        if (name === 'list_accounts') return metaListAccounts(session);
+        if (name === 'link_account') return metaLinkAccount(session);
+        if (name === 'unlink_account') return metaUnlinkAccount(session, args);
+
+        // Availability gating against the union of scopes across linked accounts.
+        const toolDef = getToolByName(name);
+        if (!toolDef || !hasScope(unionScopes(session.accounts), toolDef.scopes)) {
+            return errText(`Error: Tool "${name}" is not available. You may need to re-authenticate with additional scopes.`);
+        }
+        if (!isToolEnabled(name)) {
+            return errText(`Error: "${name}" is disabled in draft-first mode. Create or update a draft instead — the user reviews and sends it from their Drafts folder.`);
+        }
+
+        const accounts = session.accounts;
+        const multi = accounts.length > 1;
+        const selector: string | undefined = args.account;
+        const toolArgs = stripAccount(args);
+
+        if (WRITE_TOOLS.has(name)) {
+            // Writes need an explicit account whenever the choice is ambiguous.
+            let target: Account | undefined;
+            if (selector) target = findAccount(session, selector);
+            else if (accounts.length === 1) target = accounts[0];
+            if (!target) {
+                return errText(
+                    `Error: "${name}" changes a mailbox, so it needs an explicit account. ` +
+                    `Set "account" to one of: ${accounts.map(a => a.email).join(', ')}`,
+                );
+            }
+            const { gmail, authorizedScopes } = session.getClient(target.sub);
+            const result = await executeTool(name, toolArgs, gmail, authorizedScopes);
+            return multi ? annotate(target.email, target.primary, result) : result;
+        }
+
+        // Reads: a specific account if named, otherwise fan out across all linked.
+        let targets: Account[];
+        if (selector) {
+            const a = findAccount(session, selector);
+            if (!a) {
+                return errText(`Error: account "${selector}" is not linked. Linked: ${accounts.map(x => x.email).join(', ')}`);
+            }
+            targets = [a];
+        } else {
+            targets = accounts;
+        }
+
+        if (!multi) {
+            const { gmail, authorizedScopes } = session.getClient(targets[0].sub);
+            return executeTool(name, toolArgs, gmail, authorizedScopes);
+        }
+
+        const content: any[] = [];
+        for (const acct of targets) {
+            const { gmail, authorizedScopes } = session.getClient(acct.sub);
+            const result = await executeTool(name, toolArgs, gmail, authorizedScopes);
+            content.push({ type: 'text', text: `=== ${acct.email}${acct.primary ? ' (primary)' : ''} ===` });
+            for (const c of result?.content || []) content.push(c);
+        }
+        return { content };
     });
 
     return server;

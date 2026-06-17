@@ -54,12 +54,12 @@ describe('FileOAuthStore one-time consume', () => {
             codeChallenge: 'chal',
             mcpScope: 'gmail',
             resource: 'https://x/mcp',
-            googleSub: 'sub-1',
+            principalId: 'sub-1',
             createdAtSec: Math.floor(Date.now() / 1000),
         });
         expect(await store.peekAuthCodeChallenge(code)).toBe('chal');
         const first = await store.consumeAuthCode(code, 60);
-        expect(first?.googleSub).toBe('sub-1');
+        expect(first?.principalId).toBe('sub-1');
         expect(await store.consumeAuthCode(code, 60)).toBeUndefined(); // replay fails
     });
 
@@ -71,7 +71,7 @@ describe('FileOAuthStore one-time consume', () => {
             codeChallenge: 'chal',
             mcpScope: 'gmail',
             resource: 'https://x/mcp',
-            googleSub: 'sub-1',
+            principalId: 'sub-1',
             createdAtSec: Math.floor(Date.now() / 1000) - 120,
         });
         expect(await store.consumeAuthCode(code, 60)).toBeUndefined();
@@ -106,8 +106,8 @@ describe('FileOAuthStore token families', () => {
         const at = generateToken();
         const rt = generateToken();
         const now = Math.floor(Date.now() / 1000);
-        await store.putAccessToken(at, { clientId: 'c1', googleSub: 's', mcpScope: 'gmail', resource: 'r', familyId: 'fam', expiresAtSec: now + 3600 });
-        await store.putRefreshToken(rt, { clientId: 'c1', googleSub: 's', mcpScope: 'gmail', resource: 'r', familyId: 'fam', createdAtSec: now, used: false });
+        await store.putAccessToken(at, { clientId: 'c1', principalId: 's', mcpScope: 'gmail', resource: 'r', familyId: 'fam', expiresAtSec: now + 3600 });
+        await store.putRefreshToken(rt, { clientId: 'c1', principalId: 's', mcpScope: 'gmail', resource: 'r', familyId: 'fam', createdAtSec: now, used: false });
         expect(await store.getAccessToken(at)).toBeDefined();
         await store.revokeFamily('fam');
         expect(await store.getAccessToken(at)).toBeUndefined();
@@ -162,8 +162,8 @@ describe('FileOAuthStore sweep', () => {
         const now = Math.floor(Date.now() / 1000);
         const expired = generateToken();
         const live = generateToken();
-        await store.putAccessToken(expired, { clientId: 'c', googleSub: 's', mcpScope: 'gmail', resource: 'r', familyId: 'f1', expiresAtSec: now - 1 });
-        await store.putAccessToken(live, { clientId: 'c', googleSub: 's', mcpScope: 'gmail', resource: 'r', familyId: 'f2', expiresAtSec: now + 3600 });
+        await store.putAccessToken(expired, { clientId: 'c', principalId: 's', mcpScope: 'gmail', resource: 'r', familyId: 'f1', expiresAtSec: now - 1 });
+        await store.putAccessToken(live, { clientId: 'c', principalId: 's', mcpScope: 'gmail', resource: 'r', familyId: 'f2', expiresAtSec: now + 3600 });
         await store.sweep(600, 60);
         expect(await store.getAccessToken(expired)).toBeUndefined();
         expect(await store.getAccessToken(live)).toBeDefined();
