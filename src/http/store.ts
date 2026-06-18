@@ -17,6 +17,7 @@ import fs from 'fs';
 import path from 'path';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HttpConfig } from './config.js';
+import type { SendPolicy } from '../session.js';
 
 const STORE_FILE = 'oauth-store.json';
 const REFRESH_TOKEN_MAX_AGE_SEC = 60 * 60 * 24 * 30; // 30 days
@@ -31,6 +32,8 @@ export interface GoogleUserRecord {
     scopeNames: string[];
     /** The principal this account belongs to (back-reference). */
     principalId?: string;
+    /** Outbound send policy for this account (undefined => own-address-only). */
+    sendPolicy?: SendPolicy;
     updatedAt: number;
 }
 
@@ -44,10 +47,11 @@ export interface PrincipalRecord {
     createdAt: number;
 }
 
-/** Short-lived ticket binding an account-link sign-in to an existing principal. */
+/** Short-lived ticket binding an account-link / first-connect sign-in. */
 export interface LinkTicketRecord {
-    principalId: string;
-    /** Set when the link was started from the manage page; return there after. */
+    /** The principal to attach the account to; absent on first connect (then created). */
+    principalId?: string;
+    /** Set when started from the manage page; return there after the callback. */
     authRequestId?: string;
     createdAtSec: number;
 }
@@ -151,6 +155,7 @@ export interface OAuthStore {
     getGoogleRefreshToken(sub: string): Promise<string | undefined>;
     deleteGoogleUser(sub: string): Promise<void>;
     setUserPrincipal(sub: string, principalId: string): Promise<void>;
+    setSendPolicy(sub: string, policy: SendPolicy): Promise<void>;
 
     getPrincipal(principalId: string): Promise<PrincipalRecord | undefined>;
     createPrincipal(record: PrincipalRecord): Promise<void>;
@@ -377,6 +382,7 @@ export class FileOAuthStore implements OAuthStore {
                 refreshTokenEnc: enc,
                 scopeNames,
                 principalId: existing?.principalId, // preserve the back-reference
+                sendPolicy: existing?.sendPolicy, // preserve send policy
                 updatedAt: nowSec(),
             });
             this.persist();
@@ -401,6 +407,14 @@ export class FileOAuthStore implements OAuthStore {
         const rec = this.googleUsers.get(sub);
         if (rec) {
             rec.principalId = principalId;
+            this.persist();
+        }
+    }
+
+    async setSendPolicy(sub: string, policy: SendPolicy): Promise<void> {
+        const rec = this.googleUsers.get(sub);
+        if (rec) {
+            rec.sendPolicy = policy;
             this.persist();
         }
     }

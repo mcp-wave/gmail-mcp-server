@@ -6,12 +6,23 @@
 // every consumer; the tool dispatch in index.ts re-narrows it.
 export type GmailClient = any;
 
+/**
+ * Per-account outbound send policy. Sending to the account's OWN address is
+ * always allowed. Otherwise a recipient must match the allowlist (exact email,
+ * `@domain.com`, or bare `domain.com`), unless `dangerouslyAllowAll` is set.
+ */
+export type SendPolicy = {
+    allowlist: string[];
+    dangerouslyAllowAll: boolean;
+};
+
 /** A single linked Gmail account within a principal. */
 export type Account = {
     sub: string;
     email: string;
     primary: boolean;
     scopeNames: string[];
+    sendPolicy?: SendPolicy;
 };
 
 /**

@@ -9,6 +9,7 @@
 import { Firestore, Timestamp, type DocumentData } from '@google-cloud/firestore';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HttpConfig } from './config.js';
+import type { SendPolicy } from '../session.js';
 import {
     type OAuthStore,
     type GoogleUserRecord,
@@ -211,9 +212,10 @@ export class FirestoreOAuthStore implements OAuthStore {
                 email,
                 refreshTokenEnc: enc,
                 scopeNames,
-                // Preserve the principal back-reference (ignoreUndefinedProperties
-                // drops it when there's no existing record yet).
+                // Preserve the principal back-reference + send policy
+                // (ignoreUndefinedProperties drops these when absent).
                 principalId: existing?.principalId,
+                sendPolicy: existing?.sendPolicy,
                 updatedAt: nowSec(),
             });
         });
@@ -233,6 +235,13 @@ export class FirestoreOAuthStore implements OAuthStore {
             .collection(C.googleUsers)
             .doc(sub)
             .set({ principalId }, { merge: true });
+    }
+
+    async setSendPolicy(sub: string, policy: SendPolicy): Promise<void> {
+        await this.db
+            .collection(C.googleUsers)
+            .doc(sub)
+            .set({ sendPolicy: policy }, { merge: true });
     }
 
     // ---- principals -------------------------------------------------------

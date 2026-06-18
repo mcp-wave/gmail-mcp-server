@@ -61,105 +61,21 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         params: AuthorizationParams,
         res: Response,
     ): Promise<void> {
-        // If the browser already has a session, send them to the manage page so
-        // they can add/remove mailboxes before finishing — the connector's auth
-        // surface doubles as the account hub. Otherwise (first connect), log in
-        // with Google directly.
-        const sessionId = readSessionCookie((res as any).req);
-        const session = sessionId
-            ? await this.store.getSession(sessionId, this.config.sessionTtlSec)
-            : undefined;
-
-        if (session) {
-            const reqId = generateToken();
-            await this.store.putAuthRequest(reqId, {
-                clientId: client.client_id,
-                redirectUri: params.redirectUri,
-                codeChallenge: params.codeChallenge,
-                state: params.state,
-                resource: params.resource ? canonical(params.resource.href) : this.resource,
-                mcpScope: this.config.mcpScope,
-                createdAtSec: nowSec(),
-            });
-            res.redirect(`${this.config.baseUrl}/manage?req=${encodeURIComponent(reqId)}`);
-            return;
-        }
-
-        // High-entropy, one-time id ties Google's callback back to this request
-        // (it is the OAuth `state` we send to Google). Stored server-side; the
-        // claude redirect_uri here was already validated by the SDK.
-        const pendingId = generateToken();
-        await this.store.putPendingAuth({
-            id: pendingId,
+        // ALWAYS route through the setup/manage screen. Park the claude.ai
+        // authorize request; the user finishes by clicking Continue, which is the
+        // only thing that issues a code back to the agent. /manage handles the
+        // case where no session exists yet (first connect → Google login).
+        const reqId = generateToken();
+        await this.store.putAuthRequest(reqId, {
             clientId: client.client_id,
             redirectUri: params.redirectUri,
             codeChallenge: params.codeChallenge,
             state: params.state,
-            mcpScope: this.config.mcpScope,
             resource: params.resource ? canonical(params.resource.href) : this.resource,
+            mcpScope: this.config.mcpScope,
             createdAtSec: nowSec(),
         });
-        res.redirect(buildGoogleAuthUrl(this.config, pendingId));
-    }
-
-    /**
-     * Completes the flow after Google redirects back. Called by the
-     * /oauth2/google/callback route (not part of the provider interface).
-     * Returns where to send the user's browser next (claude's redirect_uri).
-     */
-    async completeGoogleAuth(
-        pendingId: string,
-        identity: GoogleIdentity,
-    ): Promise<{ redirectUri: string; code: string; state?: string; sessionId: string }> {
-        const pending = await this.store.consumePendingAuth(
-            pendingId,
-            this.config.pendingAuthTtlSec,
-        );
-        if (!pending) {
-            throw new InvalidGrantError('Unknown, expired, or already-used authorization state');
-        }
-
-        // Persist the user's Google grant (serialized per-user). Throws if no
-        // refresh token is available and none was previously stored.
-        await this.store.upsertGoogleUser(
-            identity.sub,
-            identity.email,
-            identity.refreshToken,
-            identity.scopeNames,
-        );
-
-        // Find-or-create the principal this primary account belongs to. The token
-        // we ultimately mint is bound to the PRINCIPAL, not the single account,
-        // so additional mailboxes can be linked under the same connection.
-        const existing = await this.store.getGoogleUser(identity.sub);
-        let principalId = existing?.principalId;
-        if (!principalId) {
-            principalId = generateToken();
-            await this.store.createPrincipal({
-                id: principalId,
-                primarySub: identity.sub,
-                accountSubs: [identity.sub],
-                createdAt: nowSec(),
-            });
-            await this.store.setUserPrincipal(identity.sub, principalId);
-        }
-
-        const code = generateToken();
-        await this.store.putAuthCode(code, {
-            clientId: pending.clientId,
-            redirectUri: pending.redirectUri,
-            codeChallenge: pending.codeChallenge,
-            mcpScope: pending.mcpScope,
-            resource: pending.resource,
-            principalId,
-            createdAtSec: nowSec(),
-        });
-
-        // Establish a browser session so a return visit to /authorize lands on the
-        // account-management page instead of a fresh login.
-        const sessionId = await this.createSession(principalId);
-
-        return { redirectUri: pending.redirectUri, code, state: pending.state, sessionId };
+        res.redirect(`${this.config.baseUrl}/manage?req=${encodeURIComponent(reqId)}`);
     }
 
     /** Mint a browser session for a principal; returns the raw session id (cookie value). */
@@ -189,8 +105,11 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         return principalId;
     }
 
-    /** Create a one-time ticket for an account-link sign-in. */
-    async createLinkTicket(principalId: string, authRequestId?: string): Promise<string> {
+    /**
+     * Create a one-time ticket for an account-link / first-connect sign-in.
+     * Omit principalId on first connect (the callback creates the principal).
+     */
+    async createLinkTicket(principalId?: string, authRequestId?: string): Promise<string> {
         const ticket = generateToken();
         await this.store.putLinkTicket(ticket, { principalId, authRequestId, createdAtSec: nowSec() });
         return ticket;

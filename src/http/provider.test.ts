@@ -48,18 +48,22 @@ const IDENTITY: GoogleIdentity = {
 const CHALLENGE = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM';
 
 /** Drive authorize -> Google redirect, returning the pendingId (Google `state`). */
-function runAuthorize(provider: GmailOAuthProvider): Promise<string> {
-    let captured = '';
-    const res = { redirect: (url: string) => { captured = url; } } as any;
-    return provider
-        .authorize(CLIENT, {
-            state: 'claude-state',
-            scopes: ['gmail'],
-            redirectUri: CLIENT.redirect_uris[0],
-            codeChallenge: CHALLENGE,
-            resource: new URL(RESOURCE),
-        }, res)
-        .then(() => new URL(captured).searchParams.get('state')!);
+async function connect(
+    provider: GmailOAuthProvider,
+    identity: GoogleIdentity = IDENTITY,
+): Promise<{ principalId: string; redirectUri: string; code: string; state?: string }> {
+    // Simulate the Google login that establishes the principal, then run the
+    // always-manage authorize flow and click "Continue" (finalize).
+    const principalId = await provider.ensurePrincipal(identity);
+    let captured = "";
+    const res = { redirect: (u: string) => { captured = u; } } as any;
+    await provider.authorize(CLIENT, {
+        state: "claude-state", scopes: ["gmail"], redirectUri: CLIENT.redirect_uris[0],
+        codeChallenge: CHALLENGE, resource: new URL(RESOURCE),
+    }, res);
+    const reqId = new URL(captured).searchParams.get("req")!;
+    const fin = await provider.finalizeAuthorization(reqId, principalId);
+    return { principalId, ...fin };
 }
 
 describe('GmailOAuthProvider full flow', () => {
@@ -74,8 +78,7 @@ describe('GmailOAuthProvider full flow', () => {
     afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
     it('authorize -> callback -> code -> token issues a verifiable bearer', async () => {
-        const pendingId = await runAuthorize(provider);
-        const { redirectUri, code, state } = await provider.completeGoogleAuth(pendingId, IDENTITY);
+        const { redirectUri, code, state } = await connect(provider);
         expect(redirectUri).toBe(CLIENT.redirect_uris[0]);
         expect(state).toBe('claude-state');
 
@@ -108,8 +111,7 @@ describe('GmailOAuthProvider full flow', () => {
     });
 
     it('rejects a replayed authorization code', async () => {
-        const pendingId = await runAuthorize(provider);
-        const { code } = await provider.completeGoogleAuth(pendingId, IDENTITY);
+        const { code } = await connect(provider);
         await provider.exchangeAuthorizationCode(CLIENT, code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
         await expect(
             provider.exchangeAuthorizationCode(CLIENT, code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE)),
@@ -117,16 +119,14 @@ describe('GmailOAuthProvider full flow', () => {
     });
 
     it('rejects a code exchanged with a mismatched redirect_uri', async () => {
-        const pendingId = await runAuthorize(provider);
-        const { code } = await provider.completeGoogleAuth(pendingId, IDENTITY);
+        const { code } = await connect(provider);
         await expect(
             provider.exchangeAuthorizationCode(CLIENT, code, undefined, 'https://evil.example/cb', new URL(RESOURCE)),
         ).rejects.toThrow(/redirect_uri/);
     });
 
     it('rejects a code exchanged for the wrong resource (audience)', async () => {
-        const pendingId = await runAuthorize(provider);
-        const { code } = await provider.completeGoogleAuth(pendingId, IDENTITY);
+        const { code } = await connect(provider);
         await expect(
             provider.exchangeAuthorizationCode(CLIENT, code, undefined, CLIENT.redirect_uris[0], new URL('https://other.example/mcp')),
         ).rejects.toThrow(/resource/);
@@ -137,8 +137,7 @@ describe('GmailOAuthProvider full flow', () => {
     });
 
     it('enforces audience binding at verify time', async () => {
-        const pendingId = await runAuthorize(provider);
-        const { code } = await provider.completeGoogleAuth(pendingId, IDENTITY);
+        const { code } = await connect(provider);
         const tokens = await provider.exchangeAuthorizationCode(CLIENT, code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
 
         // A provider serving a DIFFERENT resource, sharing the same store, must
@@ -148,8 +147,7 @@ describe('GmailOAuthProvider full flow', () => {
     });
 
     it('rotates refresh tokens and detects reuse, revoking the family', async () => {
-        const pendingId = await runAuthorize(provider);
-        const { code } = await provider.completeGoogleAuth(pendingId, IDENTITY);
+        const { code } = await connect(provider);
         const first = await provider.exchangeAuthorizationCode(CLIENT, code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
 
         const rotated = await provider.exchangeRefreshToken(CLIENT, first.refresh_token!, undefined, new URL(RESOURCE));
@@ -167,8 +165,7 @@ describe('GmailOAuthProvider full flow', () => {
 
     it('links a second account to the same principal (one-time ticket)', async () => {
         // Primary connect → principal owns account A.
-        const pendingId = await runAuthorize(provider);
-        const { code } = await provider.completeGoogleAuth(pendingId, IDENTITY);
+        const { code } = await connect(provider);
         const tokens = await provider.exchangeAuthorizationCode(
             CLIENT, code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE),
         );
@@ -227,22 +224,19 @@ describe('GmailOAuthProvider full flow', () => {
     });
 
     it('reuses the existing principal when the same primary reconnects', async () => {
-        const p1 = await runAuthorize(provider);
-        const c1 = (await provider.completeGoogleAuth(p1, IDENTITY)).code;
-        const t1 = await provider.exchangeAuthorizationCode(CLIENT, c1, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
+        const c1 = await connect(provider);
+        const t1 = await provider.exchangeAuthorizationCode(CLIENT, c1.code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
         const pid1 = (await provider.verifyAccessToken(t1.access_token)).extra!.principalId;
 
-        const p2 = await runAuthorize(provider);
-        const c2 = (await provider.completeGoogleAuth(p2, IDENTITY)).code;
-        const t2 = await provider.exchangeAuthorizationCode(CLIENT, c2, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
+        const c2 = await connect(provider);
+        const t2 = await provider.exchangeAuthorizationCode(CLIENT, c2.code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
         const pid2 = (await provider.verifyAccessToken(t2.access_token)).extra!.principalId;
 
         expect(pid2).toBe(pid1); // same Google primary → same principal
     });
 
     it('rejects a refresh token issued to a different client', async () => {
-        const pendingId = await runAuthorize(provider);
-        const { code } = await provider.completeGoogleAuth(pendingId, IDENTITY);
+        const { code } = await connect(provider);
         const tokens = await provider.exchangeAuthorizationCode(CLIENT, code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
         const otherClient = { ...CLIENT, client_id: 'someone-else' };
         await expect(
@@ -251,17 +245,34 @@ describe('GmailOAuthProvider full flow', () => {
     });
 
     it('revokeToken burns the whole family', async () => {
-        const pendingId = await runAuthorize(provider);
-        const { code } = await provider.completeGoogleAuth(pendingId, IDENTITY);
+        const { code } = await connect(provider);
         const tokens = await provider.exchangeAuthorizationCode(CLIENT, code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
         await provider.revokeToken(CLIENT, { token: tokens.access_token });
         await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow();
     });
 
-    it('rejects a stale pending auth (expired state)', async () => {
-        const provShort = new GmailOAuthProvider({ ...makeConfig(dir), pendingAuthTtlSec: 0 }, store);
-        const pendingId = await runAuthorize(provShort);
+    it('rejects finalizing an expired authorize request', async () => {
+        const provShort = new GmailOAuthProvider({ ...makeConfig(dir), authRequestTtlSec: 0 }, store);
+        const principalId = await provShort.ensurePrincipal(IDENTITY);
+        let captured = '';
+        const res = { redirect: (u: string) => { captured = u; } } as any;
+        await provShort.authorize(CLIENT, {
+            state: 'cs', scopes: ['gmail'], redirectUri: CLIENT.redirect_uris[0],
+            codeChallenge: CHALLENGE, resource: new URL(RESOURCE),
+        }, res);
+        const reqId = new URL(captured).searchParams.get('req')!;
         await new Promise((r) => setTimeout(r, 1100));
-        await expect(provShort.completeGoogleAuth(pendingId, IDENTITY)).rejects.toThrow(/Unknown, expired/);
+        await expect(provShort.finalizeAuthorization(reqId, principalId)).rejects.toThrow(/expired/);
+    });
+
+    it('stores and returns a per-account send policy', async () => {
+        await provider.ensurePrincipal(IDENTITY);
+        await store.setSendPolicy(IDENTITY.sub, { allowlist: ['acme.com', 'boss@partner.com'], dangerouslyAllowAll: false });
+        const u = await store.getGoogleUser(IDENTITY.sub);
+        expect(u?.sendPolicy?.allowlist).toEqual(['acme.com', 'boss@partner.com']);
+        expect(u?.sendPolicy?.dangerouslyAllowAll).toBe(false);
+        // Survives a refresh-token upsert (no new policy supplied).
+        await store.upsertGoogleUser(IDENTITY.sub, IDENTITY.email, undefined, IDENTITY.scopeNames);
+        expect((await store.getGoogleUser(IDENTITY.sub))?.sendPolicy?.allowlist).toEqual(['acme.com', 'boss@partner.com']);
     });
 });

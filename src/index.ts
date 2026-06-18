@@ -22,6 +22,7 @@ import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope
 import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import type { Account, PrincipalSession, ResolveSession } from "./session.js";
+import { disallowedRecipients, type SendContext } from "./send-policy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -158,20 +159,13 @@ async function metaUnlinkAccount(session: PrincipalSession, args: any) {
     return errText(`Unlinked ${acct.email}.`);
 }
 
-// Draft-first mode (validation/safety gate). When GMAIL_DRAFT_ONLY is truthy the
-// agent cannot send or hard-delete: outbound must go through a draft the user
-// reviews in their Drafts folder, and destructive deletes are withheld. This is
-// the enforced "draft gate" — not a polite request the model can ignore.
-const DRAFT_ONLY = /^(1|true|yes|on)$/i.test(process.env.GMAIL_DRAFT_ONLY || '');
-const DRAFT_ONLY_BLOCKED = new Set([
-    'send_email',
-    'send_draft',
-    'reply_all',
-    'delete_email',
-    'batch_delete_emails',
-]);
-function isToolEnabled(name: string): boolean {
-    return !(DRAFT_ONLY && DRAFT_ONLY_BLOCKED.has(name));
+// Per-account send policy enforcement (logic in ./send-policy.ts).
+function sendBlockedError(disallowed: string[]): { content: { type: string; text: string }[] } {
+    return errText(
+        `Error: this account is not allowed to send to: ${disallowed.join(', ')}. ` +
+        `Create a draft instead (the user reviews and sends it), or the user can allow ` +
+        `these recipients on the connection's setup screen (by email or domain).`,
+    );
 }
 
 /**
@@ -451,7 +445,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
         const session = await resolveSession(extra);
         const scopes = unionScopes(session.accounts);
         const availableTools = toolDefinitions.filter(tool =>
-            hasScope(scopes, tool.scopes) && isToolEnabled(tool.name)
+            hasScope(scopes, tool.scopes)
         );
         // Advertise the `account` selector on every Gmail tool, then append the
         // account-management meta tools.
@@ -472,8 +466,19 @@ function createMcpServer(resolveSession: ResolveSession): Server {
         args: any,
         gmail: ReturnType<typeof google.gmail>,
         authorizedScopes: string[],
+        sendCtx: SendContext,
     ): Promise<any> {
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
+            // Enforce the per-account send policy before actually sending.
+            if (action === "send") {
+                const recipients = [
+                    ...(validatedArgs.to || []),
+                    ...(validatedArgs.cc || []),
+                    ...(validatedArgs.bcc || []),
+                ];
+                const blocked = disallowedRecipients(recipients, sendCtx.ownEmail, sendCtx.policy);
+                if (blocked.length > 0) return sendBlockedError(blocked);
+            }
             let message: string;
 
             try {
@@ -887,6 +892,20 @@ function createMcpServer(resolveSession: ResolveSession): Server {
 
                 case "send_draft": {
                     const validatedArgs = SendDraftSchema.parse(args);
+                    // Enforce the send policy against the draft's actual recipients.
+                    const draft = await gmail.users.drafts.get({
+                        userId: 'me',
+                        id: validatedArgs.draftId,
+                        format: 'metadata',
+                    });
+                    const draftHeaders = draft.data.message?.payload?.headers || [];
+                    const draftRecipients = draftHeaders
+                        .filter((h) => ['to', 'cc', 'bcc'].includes((h.name || '').toLowerCase()))
+                        .flatMap((h) => (h.value || '').split(',').map((s: string) => s.trim()))
+                        .filter((s: string) => s.length > 0);
+                    const blockedDraft = disallowedRecipients(draftRecipients, sendCtx.ownEmail, sendCtx.policy);
+                    if (blockedDraft.length > 0) return sendBlockedError(blockedDraft);
+
                     const response = await gmail.users.drafts.send({
                         userId: 'me',
                         requestBody: { id: validatedArgs.draftId },
@@ -1851,9 +1870,8 @@ function createMcpServer(resolveSession: ResolveSession): Server {
         if (!toolDef || !hasScope(unionScopes(session.accounts), toolDef.scopes)) {
             return errText(`Error: Tool "${name}" is not available. You may need to re-authenticate with additional scopes.`);
         }
-        if (!isToolEnabled(name)) {
-            return errText(`Error: "${name}" is disabled in draft-first mode. Create or update a draft instead — the user reviews and sends it from their Drafts folder.`);
-        }
+
+        const sendCtx = (a: Account): SendContext => ({ ownEmail: a.email, policy: a.sendPolicy });
 
         const accounts = session.accounts;
         const multi = accounts.length > 1;
@@ -1872,7 +1890,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                 );
             }
             const { gmail, authorizedScopes } = session.getClient(target.sub);
-            const result = await executeTool(name, toolArgs, gmail, authorizedScopes);
+            const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(target));
             return multi ? annotate(target.email, target.primary, result) : result;
         }
 
@@ -1890,13 +1908,13 @@ function createMcpServer(resolveSession: ResolveSession): Server {
 
         if (!multi) {
             const { gmail, authorizedScopes } = session.getClient(targets[0].sub);
-            return executeTool(name, toolArgs, gmail, authorizedScopes);
+            return executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(targets[0]));
         }
 
         const content: any[] = [];
         for (const acct of targets) {
             const { gmail, authorizedScopes } = session.getClient(acct.sub);
-            const result = await executeTool(name, toolArgs, gmail, authorizedScopes);
+            const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(acct));
             content.push({ type: 'text', text: `=== ${acct.email}${acct.primary ? ' (primary)' : ''} ===` });
             for (const c of result?.content || []) content.push(c);
         }
