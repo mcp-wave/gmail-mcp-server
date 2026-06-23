@@ -19,7 +19,7 @@ import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, get
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
 import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
-import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema } from "./tools.js";
+import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ListSendAsSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import type { Account, PrincipalSession, ResolveSession } from "./session.js";
 import { disallowedRecipients, type SendContext } from "./send-policy.js";
@@ -1324,6 +1324,32 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                     };
                 }
 
+                case "list_send_as": {
+                    ListSendAsSchema.parse(args);
+                    const sendAsResponse = await gmail.users.settings.sendAs.list({ userId: 'me' });
+                    const aliases = sendAsResponse.data.sendAs || [];
+                    if (aliases.length === 0) {
+                        return { content: [{ type: "text", text: "No send-as addresses configured." }] };
+                    }
+                    const lines = aliases.map((a) => {
+                        const tags = [
+                            a.isPrimary ? 'primary' : null,
+                            a.isDefault ? 'default' : null,
+                            a.verificationStatus && a.verificationStatus !== 'accepted'
+                                ? `verification: ${a.verificationStatus}`
+                                : 'verified',
+                        ].filter(Boolean).join(', ');
+                        const name = a.displayName ? ` "${a.displayName}"` : '';
+                        return `- ${a.sendAsEmail}${name} (${tags})`;
+                    });
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Send-as addresses (use as the "from" parameter):\n${lines.join('\n')}`,
+                        }],
+                    };
+                }
+
                 case "delete_filter": {
                     const validatedArgs = DeleteFilterSchema.parse(args);
                     const result = await deleteFilter(gmail, validatedArgs.filterId);
@@ -1788,6 +1814,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                         threadId: threadId,
                         inReplyTo: originalMessageId,
                         attachments: validatedArgs.attachments,
+                        from: validatedArgs.from, // send as a configured send-as alias
                     };
 
                     // Use the existing handleEmailAction to send the reply

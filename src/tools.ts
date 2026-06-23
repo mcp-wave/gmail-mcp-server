@@ -194,7 +194,10 @@ export const ReplyAllSchema = z.object({
   htmlBody: z.string().optional().describe("HTML version of the reply body"),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
   attachments: z.array(z.string()).optional().describe("List of file paths to attach to the reply"),
+  from: z.string().optional().describe("Send the reply as this address (must be a configured send-as alias in Gmail settings). Defaults to the account's default send-as address. Use list_send_as to discover available aliases."),
 });
+
+export const ListSendAsSchema = z.object({});
 
 // Tool definition type
 export interface ToolAnnotations {
@@ -405,6 +408,13 @@ export const toolDefinitions: ToolDefinition[] = [
     schema: GetFilterSchema,
     scopes: ["gmail.settings.basic"],
     annotations: { title: "Get Filter", readOnlyHint: true },
+  },
+  {
+    name: "list_send_as",
+    description: "Lists the send-as addresses (aliases) configured for the account, including which is the default and each one's verification status. Use the address as the 'from' parameter on send_email, draft_email, or reply_all to send as that alias.",
+    schema: ListSendAsSchema,
+    scopes: ["gmail.settings.basic"],
+    annotations: { title: "List Send-As Aliases", readOnlyHint: true },
   },
   {
     name: "create_filter",
