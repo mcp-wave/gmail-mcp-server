@@ -21,6 +21,41 @@ export function emailAddressOf(value: string): string {
     return (m ? m[1] : String(value)).trim().toLowerCase();
 }
 
+// Public / free email providers: allowing the WHOLE domain would let the agent
+// email anyone there, so these are forbidden as domain-level allowlist entries.
+// (Specific addresses like alice@gmail.com are still allowable.)
+export const PUBLIC_EMAIL_DOMAINS = new Set<string>([
+    'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.co.uk', 'yahoo.co.in', 'ymail.com',
+    'rocketmail.com', 'outlook.com', 'outlook.co.uk', 'hotmail.com', 'hotmail.co.uk',
+    'live.com', 'msn.com', 'icloud.com', 'me.com', 'mac.com', 'aol.com', 'aim.com',
+    'proton.me', 'protonmail.com', 'pm.me', 'gmx.com', 'gmx.net', 'mail.com', 'zoho.com',
+    'yandex.com', 'yandex.ru', 'fastmail.com', 'hey.com', 'qq.com', '163.com', '126.com',
+    'tutanota.com', 'tuta.io',
+]);
+
+/** Is `entry` a domain-level allowlist entry (@domain or bare domain) rather than an exact address? */
+export function isDomainEntry(entry: string): boolean {
+    const e = entry.trim().toLowerCase();
+    return e.startsWith('@') || !e.includes('@');
+}
+
+export function isPublicEmailDomain(domain: string): boolean {
+    return PUBLIC_EMAIL_DOMAINS.has(domain.trim().toLowerCase().replace(/^@/, ''));
+}
+
+/**
+ * Returns a rejection reason if this allowlist entry is not permitted (a
+ * domain-level entry for a public email provider), else null.
+ */
+export function rejectedAllowlistEntry(entry: string): string | null {
+    const e = entry.trim().toLowerCase();
+    if (isDomainEntry(e) && isPublicEmailDomain(e)) {
+        const d = e.replace(/^@/, '');
+        return `"${d}" is a public email provider — allowing the whole domain would let the agent email anyone there. Allow a specific address (e.g. someone@${d}) instead.`;
+    }
+    return null;
+}
+
 export function recipientAllowed(recipient: string, ownEmail: string, policy?: SendPolicy): boolean {
     if (!policy) return true; // no policy configured => unrestricted (local mode)
     if (policy.dangerouslyAllowAll) return true;

@@ -22,6 +22,7 @@ import { GmailOAuthProvider } from './provider.js';
 import { GmailClientCache, exchangeGoogleCode, buildGoogleAuthUrl, ReauthRequiredError } from './google.js';
 import type { OAuthStore } from './store.js';
 import { SESSION_COOKIE, readSessionCookie } from './cookies.js';
+import { rejectedAllowlistEntry } from '../send-policy.js';
 import type { PrincipalSession, Account, ResolveSession, SendPolicy } from '../session.js';
 
 /** What each tool call needs: a Gmail client + the caller's granted scopes. */
@@ -207,7 +208,9 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
             const allowlist = String(req.body?.allowlist || '')
                 .split(/[\s,;]+/)
                 .map((s) => s.trim().toLowerCase())
-                .filter((s) => s.length > 0);
+                .filter((s) => s.length > 0)
+                // Drop forbidden domain-level entries (public email providers).
+                .filter((s) => !rejectedAllowlistEntry(s));
             const dangerouslyAllowAll = req.body?.dangerous === 'on' || req.body?.dangerous === 'true';
             await store.setSendPolicy(sub, { allowlist, dangerouslyAllowAll });
             cache.evict(sub); // pick up the new policy on next use

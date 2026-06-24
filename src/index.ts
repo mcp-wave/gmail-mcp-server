@@ -22,7 +22,7 @@ import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope
 import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ListSendAsSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import type { Account, PrincipalSession, ResolveSession, SendPolicy } from "./session.js";
-import { disallowedRecipients, emailAddressOf, type SendContext } from "./send-policy.js";
+import { disallowedRecipients, emailAddressOf, isPublicEmailDomain, rejectedAllowlistEntry, type SendContext } from "./send-policy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -214,6 +214,8 @@ async function metaAllowSender(session: PrincipalSession, server: Server, args: 
     if ('error' in acct) return errText(`Error: ${acct.error}`);
     const entry = String(args?.recipient || '').trim().toLowerCase();
     if (!entry) return errText('Provide a recipient email address or domain to allow.');
+    const rejected = rejectedAllowlistEntry(entry);
+    if (rejected) return errText(`Error: ${rejected}`);
     const confirm = await elicitConfirm(server, `Always allow ${acct.email} to send to "${entry}"?`);
     if (confirm.supported && confirm.choice !== 'yes') return errText('No change made.');
     const cur = acct.sendPolicy || { allowlist: [], dangerouslyAllowAll: false };
@@ -620,22 +622,55 @@ function createMcpServer(resolveSession: ResolveSession): Server {
         async function gateSend(recipients: Array<string | undefined>): Promise<{ allow: true } | { allow: false; deny: any }> {
             const blocked = disallowedRecipients(recipients, sendCtx.ownEmail, sendCtx.policy);
             if (blocked.length === 0) return { allow: true };
+
+            // Distinct domains among the blocked recipients — surfaced as "allow the
+            // whole domain" options when a pattern emerges. Public providers
+            // (gmail.com, etc.) are excluded: allowing the whole domain there would
+            // mean "send to anyone", so only specific addresses can be allowed.
+            const domains = [...new Set(
+                blocked.map((r) => emailAddressOf(r).split('@')[1]).filter(Boolean),
+            )].filter((d) => !isPublicEmailDomain(d));
+
+            const options: Array<{ value: string; label: string }> = [
+                { value: 'once', label: 'Send this time only' },
+                {
+                    value: 'always',
+                    label: blocked.length === 1
+                        ? `Always allow ${blocked[0]}`
+                        : `Always allow these ${blocked.length} recipients`,
+                },
+            ];
+            if (domains.length === 1) {
+                options.push({ value: 'domain', label: `Always allow anyone @${domains[0]}` });
+            } else if (domains.length > 1) {
+                options.push({ value: 'domains', label: `Always allow all ${domains.length} domains (${domains.join(', ')})` });
+            }
+            options.push({ value: 'cancel', label: "Don't send" });
+
+            const hint = domains.length === 1
+                ? ` (they're all @${domains[0]} — you can allow the whole domain)`
+                : '';
             const outcome = await elicitChoice(
                 server,
-                `${sendCtx.ownEmail} isn't allowed to send to: ${blocked.join(', ')}. How should I proceed?`,
-                [
-                    { value: 'once', label: 'Send this time only' },
-                    { value: 'always', label: 'Always allow these recipients (save for this account)' },
-                    { value: 'cancel', label: "Don't send" },
-                ],
+                `${sendCtx.ownEmail} isn't allowed to send to: ${blocked.join(', ')}.${hint} How should I proceed?`,
+                options,
             );
             if (!outcome.supported) return { allow: false, deny: sendBlockedError(blocked) };
-            if (outcome.choice === 'always') {
-                if (sendCtx.persistAllow) await sendCtx.persistAllow(blocked);
-                return { allow: true };
+            switch (outcome.choice) {
+                case 'once':
+                    return { allow: true };
+                case 'always':
+                    if (sendCtx.persistAllow) await sendCtx.persistAllow(blocked);
+                    return { allow: true };
+                case 'domain':
+                    if (sendCtx.persistAllow) await sendCtx.persistAllow([domains[0]]);
+                    return { allow: true };
+                case 'domains':
+                    if (sendCtx.persistAllow) await sendCtx.persistAllow(domains);
+                    return { allow: true };
+                default:
+                    return { allow: false, deny: errText(`Send cancelled — not sent to: ${blocked.join(', ')}.`) };
             }
-            if (outcome.choice === 'once') return { allow: true };
-            return { allow: false, deny: errText(`Send cancelled — not sent to: ${blocked.join(', ')}.`) };
         }
 
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {

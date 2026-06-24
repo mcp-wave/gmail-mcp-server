@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { recipientAllowed, disallowedRecipients, emailAddressOf } from './send-policy.js';
+import { recipientAllowed, disallowedRecipients, emailAddressOf, rejectedAllowlistEntry, isPublicEmailDomain } from './send-policy.js';
 import type { SendPolicy } from './session.js';
 
 const OWN = 'me@example.com';
@@ -66,5 +66,34 @@ describe('disallowedRecipients', () => {
 
     it('returns empty when all allowed', () => {
         expect(disallowedRecipients(['me@example.com'], OWN, { allowlist: [], dangerouslyAllowAll: false })).toEqual([]);
+    });
+});
+
+describe('public email domains forbidden as domain-level allowlist entries', () => {
+    it('identifies public providers', () => {
+        expect(isPublicEmailDomain('gmail.com')).toBe(true);
+        expect(isPublicEmailDomain('@gmail.com')).toBe(true);
+        expect(isPublicEmailDomain('GMAIL.COM')).toBe(true);
+        expect(isPublicEmailDomain('acme.com')).toBe(false);
+    });
+
+    it('rejects a bare public domain entry', () => {
+        expect(rejectedAllowlistEntry('gmail.com')).toMatch(/public email provider/);
+        expect(rejectedAllowlistEntry('@outlook.com')).toMatch(/public email provider/);
+    });
+
+    it('allows a specific address at a public provider', () => {
+        expect(rejectedAllowlistEntry('alice@gmail.com')).toBeNull();
+    });
+
+    it('allows a real company domain', () => {
+        expect(rejectedAllowlistEntry('acme.com')).toBeNull();
+        expect(rejectedAllowlistEntry('@acme.com')).toBeNull();
+    });
+
+    it('a specific gmail address is still honored by the policy', () => {
+        const p: SendPolicy = { allowlist: ['alice@gmail.com'], dangerouslyAllowAll: false };
+        expect(recipientAllowed('alice@gmail.com', OWN, p)).toBe(true);
+        expect(recipientAllowed('bob@gmail.com', OWN, p)).toBe(false);
     });
 });
