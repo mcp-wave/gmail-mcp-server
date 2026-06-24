@@ -8,7 +8,12 @@
 
 import type { SendPolicy } from './session.js';
 
-export type SendContext = { ownEmail: string; policy?: SendPolicy };
+export type SendContext = {
+    ownEmail: string;
+    policy?: SendPolicy;
+    // Persist newly-approved recipients to this account's allowlist (hosted only).
+    persistAllow?: (entries: string[]) => Promise<void>;
+};
 
 /** Extract the bare lowercase address from a "Name <a@b.com>" or "a@b.com" value. */
 export function emailAddressOf(value: string): string {

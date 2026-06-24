@@ -459,5 +459,9 @@ async function buildPrincipalSession(
             await store.deleteGoogleUser(sub);
             cache.evict(sub);
         },
+        setSendPolicy: async (sub: string, policy: SendPolicy) => {
+            await store.setSendPolicy(sub, policy);
+            cache.evict(sub); // rebuild with the new policy next request
+        },
     };
 }

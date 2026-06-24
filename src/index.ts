@@ -21,8 +21,8 @@ import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader
 import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
 import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ListSendAsSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
-import type { Account, PrincipalSession, ResolveSession } from "./session.js";
-import { disallowedRecipients, type SendContext } from "./send-policy.js";
+import type { Account, PrincipalSession, ResolveSession, SendPolicy } from "./session.js";
+import { disallowedRecipients, emailAddressOf, type SendContext } from "./send-policy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -126,6 +126,28 @@ function metaToolDefs(session: PrincipalSession): any[] {
             inputSchema: { type: 'object', properties: { account: { type: 'string', description: 'Email address of the account to unlink.' } }, required: ['account'] },
         });
     }
+    if (session.setSendPolicy) {
+        tools.push({
+            name: 'get_send_policy',
+            description: "Show the outbound send policy (allowlist / dangerous flag) for each linked account. Sending to an account's own address is always allowed.",
+            inputSchema: { type: 'object', properties: { account: { type: 'string', description: 'Email of the account (optional; defaults to all).' } } },
+        });
+        tools.push({
+            name: 'allow_send_recipient',
+            description: 'Permanently allow an account to send to a recipient or domain (adds to its allowlist). Confirms with the user first. Use this when the user wants to whitelist someone for the future.',
+            inputSchema: { type: 'object', properties: { account: { type: 'string', description: 'Email of the sending account.' }, recipient: { type: 'string', description: 'Email address or domain to allow (e.g. boss@acme.com or acme.com).' } }, required: ['recipient'] },
+        });
+        tools.push({
+            name: 'disallow_send_recipient',
+            description: "Remove a recipient or domain from an account's send allowlist. Confirms with the user first.",
+            inputSchema: { type: 'object', properties: { account: { type: 'string', description: 'Email of the sending account.' }, recipient: { type: 'string', description: 'Email address or domain to remove.' } }, required: ['recipient'] },
+        });
+        tools.push({
+            name: 'set_dangerous_send',
+            description: 'Turn the "allow sending to anyone" blanket override on or off for an account. Strongly confirms with the user first.',
+            inputSchema: { type: 'object', properties: { account: { type: 'string', description: 'Email of the account.' }, enabled: { type: 'boolean', description: 'true = allow sending to anyone (no checks); false = restore the allowlist gate.' } }, required: ['enabled'] },
+        });
+    }
     return tools;
 }
 
@@ -157,6 +179,129 @@ async function metaUnlinkAccount(session: PrincipalSession, args: any) {
     if (acct.primary) return errText('Cannot unlink the primary account.');
     await session.unlinkAccount(acct.sub);
     return errText(`Unlinked ${acct.email}.`);
+}
+
+// --- Send-policy management meta tools (hosted only) ------------------------
+
+function describePolicy(p?: SendPolicy): string {
+    if (p?.dangerouslyAllowAll) return 'DANGEROUS — may send to anyone';
+    if (p && p.allowlist.length) return `allowed: ${p.allowlist.join(', ')} (+ own address)`;
+    return 'own address only';
+}
+
+/** Resolve which account a settings tool targets. */
+function settingsAccount(session: PrincipalSession, args: any): Account | { error: string } {
+    if (args?.account) {
+        const a = findAccount(session, args.account);
+        return a || { error: `account "${args.account}" is not linked. Linked: ${session.accounts.map(x => x.email).join(', ')}` };
+    }
+    if (session.accounts.length === 1) return session.accounts[0];
+    return { error: `Specify which account: ${session.accounts.map(a => a.email).join(', ')}` };
+}
+
+async function metaGetSendPolicy(session: PrincipalSession, args: any) {
+    const accts = args?.account
+        ? session.accounts.filter(a => a === findAccount(session, args.account))
+        : session.accounts;
+    if (accts.length === 0) return errText('No matching account.');
+    const lines = accts.map(a => `- ${a.email}: ${describePolicy(a.sendPolicy)}`);
+    return errText(`Send policy (sending to an account's own address is always allowed):\n${lines.join('\n')}`);
+}
+
+async function metaAllowSender(session: PrincipalSession, server: Server, args: any) {
+    if (!session.setSendPolicy) return errText('Send settings are only available on the hosted server.');
+    const acct = settingsAccount(session, args);
+    if ('error' in acct) return errText(`Error: ${acct.error}`);
+    const entry = String(args?.recipient || '').trim().toLowerCase();
+    if (!entry) return errText('Provide a recipient email address or domain to allow.');
+    const confirm = await elicitConfirm(server, `Always allow ${acct.email} to send to "${entry}"?`);
+    if (confirm.supported && confirm.choice !== 'yes') return errText('No change made.');
+    const cur = acct.sendPolicy || { allowlist: [], dangerouslyAllowAll: false };
+    const merged = Array.from(new Set([...cur.allowlist, entry]));
+    await session.setSendPolicy(acct.sub, { allowlist: merged, dangerouslyAllowAll: cur.dangerouslyAllowAll });
+    return errText(`Allowed "${entry}" for ${acct.email}. Now: ${describePolicy({ allowlist: merged, dangerouslyAllowAll: cur.dangerouslyAllowAll })}.`);
+}
+
+async function metaDisallowSender(session: PrincipalSession, server: Server, args: any) {
+    if (!session.setSendPolicy) return errText('Send settings are only available on the hosted server.');
+    const acct = settingsAccount(session, args);
+    if ('error' in acct) return errText(`Error: ${acct.error}`);
+    const entry = String(args?.recipient || '').trim().toLowerCase();
+    if (!entry) return errText('Provide a recipient email address or domain to remove.');
+    const confirm = await elicitConfirm(server, `Stop allowing ${acct.email} to send to "${entry}"?`);
+    if (confirm.supported && confirm.choice !== 'yes') return errText('No change made.');
+    const cur = acct.sendPolicy || { allowlist: [], dangerouslyAllowAll: false };
+    const filtered = cur.allowlist.filter(e => e !== entry);
+    await session.setSendPolicy(acct.sub, { allowlist: filtered, dangerouslyAllowAll: cur.dangerouslyAllowAll });
+    return errText(`Removed "${entry}" from ${acct.email}. Now: ${describePolicy({ allowlist: filtered, dangerouslyAllowAll: cur.dangerouslyAllowAll })}.`);
+}
+
+async function metaSetDangerous(session: PrincipalSession, server: Server, args: any) {
+    if (!session.setSendPolicy) return errText('Send settings are only available on the hosted server.');
+    const acct = settingsAccount(session, args);
+    if ('error' in acct) return errText(`Error: ${acct.error}`);
+    const enabled = args?.enabled === true || args?.enabled === 'true' || args?.enabled === 'on';
+    const confirm = await elicitConfirm(
+        server,
+        enabled
+            ? `⚠️ Allow ${acct.email} to send email to ANYONE, with no recipient checks? This removes the send safety gate.`
+            : `Turn OFF "send to anyone" for ${acct.email} and restore the allowlist gate?`,
+    );
+    if (confirm.supported && confirm.choice !== 'yes') return errText('No change made.');
+    const cur = acct.sendPolicy || { allowlist: [], dangerouslyAllowAll: false };
+    await session.setSendPolicy(acct.sub, { allowlist: cur.allowlist, dangerouslyAllowAll: enabled });
+    return errText(`${acct.email}: "send to anyone" is now ${enabled ? 'ENABLED ⚠️' : 'disabled'}.`);
+}
+
+// --- Elicitation helpers ---------------------------------------------------
+// MCP elicitation lets the SERVER ask the user a question mid-tool-call (via the
+// client). elicitInput throws synchronously if the client hasn't advertised the
+// elicitation capability, so we can fall back instantly with no hang.
+
+const ELICIT_TIMEOUT_MS = 5 * 60 * 1000;
+
+type ElicitOutcome = { supported: true; choice: string | null } | { supported: false };
+
+/** Ask the user to pick one of `options` (value/label). Returns the chosen value. */
+async function elicitChoice(
+    server: Server,
+    message: string,
+    options: Array<{ value: string; label: string }>,
+): Promise<ElicitOutcome> {
+    try {
+        const res = await server.elicitInput(
+            {
+                message,
+                requestedSchema: {
+                    type: 'object',
+                    properties: {
+                        choice: {
+                            type: 'string',
+                            description: 'How to proceed.',
+                            enum: options.map((o) => o.value),
+                            enumNames: options.map((o) => o.label),
+                        },
+                    },
+                    required: ['choice'],
+                },
+            } as any,
+            { timeout: ELICIT_TIMEOUT_MS },
+        );
+        if (res.action !== 'accept') return { supported: true, choice: null };
+        const c = (res.content as any)?.choice;
+        return { supported: true, choice: typeof c === 'string' ? c : null };
+    } catch {
+        // Client doesn't support elicitation (or it failed) — caller decides fallback.
+        return { supported: false };
+    }
+}
+
+/** Yes/no confirmation. Returns true only on an explicit "yes". */
+async function elicitConfirm(server: Server, message: string): Promise<ElicitOutcome> {
+    return elicitChoice(server, message, [
+        { value: 'yes', label: 'Yes, proceed' },
+        { value: 'no', label: 'No, cancel' },
+    ]);
 }
 
 // Per-account send policy enforcement (logic in ./send-policy.ts).
@@ -468,16 +613,40 @@ function createMcpServer(resolveSession: ResolveSession): Server {
         authorizedScopes: string[],
         sendCtx: SendContext,
     ): Promise<any> {
+        // Gate a send against the per-account policy. If recipients are blocked,
+        // ask the user (elicitation) to allow once, always (save), or cancel.
+        // Returns { allow } when the send may proceed, or { deny } with the result
+        // to return instead.
+        async function gateSend(recipients: Array<string | undefined>): Promise<{ allow: true } | { allow: false; deny: any }> {
+            const blocked = disallowedRecipients(recipients, sendCtx.ownEmail, sendCtx.policy);
+            if (blocked.length === 0) return { allow: true };
+            const outcome = await elicitChoice(
+                server,
+                `${sendCtx.ownEmail} isn't allowed to send to: ${blocked.join(', ')}. How should I proceed?`,
+                [
+                    { value: 'once', label: 'Send this time only' },
+                    { value: 'always', label: 'Always allow these recipients (save for this account)' },
+                    { value: 'cancel', label: "Don't send" },
+                ],
+            );
+            if (!outcome.supported) return { allow: false, deny: sendBlockedError(blocked) };
+            if (outcome.choice === 'always') {
+                if (sendCtx.persistAllow) await sendCtx.persistAllow(blocked);
+                return { allow: true };
+            }
+            if (outcome.choice === 'once') return { allow: true };
+            return { allow: false, deny: errText(`Send cancelled — not sent to: ${blocked.join(', ')}.`) };
+        }
+
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
             // Enforce the per-account send policy before actually sending.
             if (action === "send") {
-                const recipients = [
+                const gate = await gateSend([
                     ...(validatedArgs.to || []),
                     ...(validatedArgs.cc || []),
                     ...(validatedArgs.bcc || []),
-                ];
-                const blocked = disallowedRecipients(recipients, sendCtx.ownEmail, sendCtx.policy);
-                if (blocked.length > 0) return sendBlockedError(blocked);
+                ]);
+                if (!gate.allow) return gate.deny;
             }
             let message: string;
 
@@ -903,8 +1072,8 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                         .filter((h) => ['to', 'cc', 'bcc'].includes((h.name || '').toLowerCase()))
                         .flatMap((h) => (h.value || '').split(',').map((s: string) => s.trim()))
                         .filter((s: string) => s.length > 0);
-                    const blockedDraft = disallowedRecipients(draftRecipients, sendCtx.ownEmail, sendCtx.policy);
-                    if (blockedDraft.length > 0) return sendBlockedError(blockedDraft);
+                    const gate = await gateSend(draftRecipients);
+                    if (!gate.allow) return gate.deny;
 
                     const response = await gmail.users.drafts.send({
                         userId: 'me',
@@ -1891,6 +2060,11 @@ function createMcpServer(resolveSession: ResolveSession): Server {
         if (name === 'list_accounts') return metaListAccounts(session);
         if (name === 'link_account') return metaLinkAccount(session);
         if (name === 'unlink_account') return metaUnlinkAccount(session, args);
+        // Send-policy management (confirmed via elicitation).
+        if (name === 'get_send_policy') return metaGetSendPolicy(session, args);
+        if (name === 'allow_send_recipient') return metaAllowSender(session, server, args);
+        if (name === 'disallow_send_recipient') return metaDisallowSender(session, server, args);
+        if (name === 'set_dangerous_send') return metaSetDangerous(session, server, args);
 
         // Availability gating against the union of scopes across linked accounts.
         const toolDef = getToolByName(name);
@@ -1898,7 +2072,22 @@ function createMcpServer(resolveSession: ResolveSession): Server {
             return errText(`Error: Tool "${name}" is not available. You may need to re-authenticate with additional scopes.`);
         }
 
-        const sendCtx = (a: Account): SendContext => ({ ownEmail: a.email, policy: a.sendPolicy });
+        const sendCtx = (a: Account): SendContext => ({
+            ownEmail: a.email,
+            policy: a.sendPolicy,
+            persistAllow: session.setSendPolicy
+                ? async (entries: string[]) => {
+                    const cur = a.sendPolicy || { allowlist: [], dangerouslyAllowAll: false };
+                    const merged = Array.from(
+                        new Set([...cur.allowlist, ...entries.map(emailAddressOf)]),
+                    );
+                    await session.setSendPolicy!(a.sub, {
+                        allowlist: merged,
+                        dangerouslyAllowAll: cur.dangerouslyAllowAll,
+                    });
+                }
+                : undefined,
+        });
 
         const accounts = session.accounts;
         const multi = accounts.length > 1;

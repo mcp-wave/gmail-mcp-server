@@ -36,6 +36,8 @@ export type PrincipalSession = {
     // Account-management ops, present only on the hosted (multi-account) server.
     linkAccount?: () => Promise<string>; // returns a sign-in URL for the user
     unlinkAccount?: (sub: string) => Promise<void>;
+    // Persist a per-account send policy (hosted only).
+    setSendPolicy?: (sub: string, policy: SendPolicy) => Promise<void>;
 };
 
 export type ResolveSession = (extra?: any) => Promise<PrincipalSession> | PrincipalSession;
