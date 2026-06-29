@@ -19,7 +19,7 @@ import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, get
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
 import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
-import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ListSendAsSchema } from "./tools.js";
+import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ListSendAsSchema, TrashEmailSchema, BatchTrashEmailsSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import type { Account, PrincipalSession, ResolveSession, SendPolicy } from "./session.js";
 import { disallowedRecipients, emailAddressOf, isPublicEmailDomain, rejectedAllowlistEntry, type SendContext } from "./send-policy.js";
@@ -66,7 +66,8 @@ let authorizedScopes: string[] = DEFAULT_SCOPES;
 const WRITE_TOOLS = new Set([
     'send_email', 'draft_email', 'send_draft', 'delete_draft', 'update_draft',
     'modify_email', 'delete_email', 'batch_modify_emails', 'report_phishing',
-    'batch_report_phishing', 'batch_delete_emails', 'create_label', 'update_label',
+    'batch_report_phishing', 'batch_delete_emails', 'trash_email', 'batch_trash_emails',
+    'create_label', 'update_label',
     'delete_label', 'get_or_create_label', 'create_filter', 'delete_filter',
     'create_filter_from_template', 'reply_all', 'modify_thread',
 ]);
@@ -673,6 +674,20 @@ function createMcpServer(resolveSession: ResolveSession): Server {
             }
         }
 
+        // Confirm a permanent (irreversible) delete via elicitation. Falls back to
+        // a hard block (no delete) if the client can't confirm — the safe default.
+        async function confirmPermanentDelete(count: number): Promise<{ allow: true } | { allow: false; deny: any }> {
+            const msg = count === 1
+                ? 'Permanently delete this message? This CANNOT be undone — it bypasses Trash. (trash_email moves it to Trash instead, recoverable for 30 days.)'
+                : `Permanently delete ${count} message(s)? This CANNOT be undone — it bypasses Trash. (batch_trash_emails moves them to Trash instead, recoverable for 30 days.)`;
+            const c = await elicitConfirm(server, msg);
+            if (!c.supported) {
+                return { allow: false, deny: errText('Permanent delete was not confirmed (this client cannot show a confirmation prompt). Use trash_email / batch_trash_emails instead — those are recoverable.') };
+            }
+            if (c.choice !== 'yes') return { allow: false, deny: errText('Permanent delete cancelled.') };
+            return { allow: true };
+        }
+
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
             // Enforce the per-account send policy before actually sending.
             if (action === "send") {
@@ -1077,8 +1092,48 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                     };
                 }
 
+                case "trash_email": {
+                    const validatedArgs = TrashEmailSchema.parse(args);
+                    await gmail.users.messages.trash({
+                        userId: 'me',
+                        id: validatedArgs.messageId,
+                    });
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: `Email ${validatedArgs.messageId} moved to Trash (recoverable for 30 days).`,
+                            },
+                        ],
+                    };
+                }
+
+                case "batch_trash_emails": {
+                    const validatedArgs = BatchTrashEmailsSchema.parse(args);
+                    const messageIds = validatedArgs.messageIds;
+                    const batchSize = validatedArgs.batchSize || 50;
+                    const { successes, failures } = await processBatches(
+                        messageIds,
+                        batchSize,
+                        async (batch) => Promise.all(
+                            batch.map(async (messageId) => {
+                                await gmail.users.messages.trash({ userId: 'me', id: messageId });
+                                return { messageId, success: true };
+                            })
+                        )
+                    );
+                    let summary = `Batch trash complete.\nMoved to Trash (recoverable): ${successes.length}/${messageIds.length}`;
+                    if (failures.length > 0) {
+                        summary += `\nFailed: ${failures.length}\n` +
+                            failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${f.error.message})`).join('\n');
+                    }
+                    return { content: [{ type: "text", text: summary }] };
+                }
+
                 case "delete_email": {
                     const validatedArgs = DeleteEmailSchema.parse(args);
+                    const gate = await confirmPermanentDelete(1);
+                    if (!gate.allow) return gate.deny;
                     await gmail.users.messages.delete({
                         userId: 'me',
                         id: validatedArgs.messageId,
@@ -1088,7 +1143,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                         content: [
                             {
                                 type: "text",
-                                text: `Email ${validatedArgs.messageId} deleted successfully`,
+                                text: `Email ${validatedArgs.messageId} permanently deleted`,
                             },
                         ],
                     };
@@ -1323,6 +1378,9 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                     const validatedArgs = BatchDeleteEmailsSchema.parse(args);
                     const messageIds = validatedArgs.messageIds;
                     const batchSize = validatedArgs.batchSize || 50;
+
+                    const gate = await confirmPermanentDelete(messageIds.length);
+                    if (!gate.allow) return gate.deny;
 
                     // Process messages in batches
                     const { successes, failures } = await processBatches(

@@ -106,6 +106,14 @@ export const BatchDeleteEmailsSchema = z.object({
   batchSize: z.number().optional().default(50).describe("Number of messages to process in each batch (default: 50)"),
 });
 
+export const TrashEmailSchema = z.object({
+  messageId: z.string().describe("ID of the email message to move to Trash"),
+});
+export const BatchTrashEmailsSchema = z.object({
+  messageIds: z.array(z.string()).describe("List of message IDs to move to Trash"),
+  batchSize: z.number().optional().default(50).describe("Number of messages to process in each batch (default: 50)"),
+});
+
 export const CreateFilterSchema = z.object({
   criteria: z.object({
     from: z.string().optional().describe("Sender email address to match"),
@@ -322,8 +330,22 @@ export const toolDefinitions: ToolDefinition[] = [
     annotations: { title: "Modify Email", destructiveHint: true, idempotentHint: true },
   },
   {
+    name: "trash_email",
+    description: "Moves an email to Trash (recoverable for 30 days). Prefer this over delete_email — delete_email is a permanent, irreversible delete.",
+    schema: TrashEmailSchema,
+    scopes: ["gmail.modify"],
+    annotations: { title: "Trash Email", destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "batch_trash_emails",
+    description: "Moves multiple emails to Trash (recoverable for 30 days). Prefer this over batch_delete_emails for clearing the inbox.",
+    schema: BatchTrashEmailsSchema,
+    scopes: ["gmail.modify"],
+    annotations: { title: "Batch Trash Emails", destructiveHint: false, idempotentHint: true },
+  },
+  {
     name: "delete_email",
-    description: "Permanently deletes an email",
+    description: "PERMANENTLY deletes an email (bypasses Trash, cannot be undone). Use trash_email instead unless permanent deletion is explicitly required.",
     schema: DeleteEmailSchema,
     scopes: ["gmail.modify"],
     annotations: { title: "Delete Email", destructiveHint: true },
@@ -351,7 +373,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "batch_delete_emails",
-    description: "Permanently deletes multiple emails in batches",
+    description: "PERMANENTLY deletes multiple emails (bypasses Trash, cannot be undone). Use batch_trash_emails instead unless permanent deletion is explicitly required.",
     schema: BatchDeleteEmailsSchema,
     scopes: ["gmail.modify"],
     annotations: { title: "Batch Delete Emails", destructiveHint: true },
