@@ -73,6 +73,10 @@ export interface AuthRequestRecord {
     state?: string;
     resource: string;
     mcpScope: string;
+    /** The principal established by the Google login WITHIN this request's flow.
+     *  Set once the user signs in; the manage page + finalize key off this, never
+     *  an ambient browser cookie (which would bleed across claude.ai accounts). */
+    principalId?: string;
     createdAtSec: number;
 }
 
@@ -171,6 +175,7 @@ export interface OAuthStore {
 
     putAuthRequest(id: string, record: AuthRequestRecord): Promise<void>;
     getAuthRequest(id: string, ttlSec: number): Promise<AuthRequestRecord | undefined>;
+    setAuthRequestPrincipal(id: string, principalId: string): Promise<void>;
     consumeAuthRequest(id: string, ttlSec: number): Promise<AuthRequestRecord | undefined>;
 
     /** Best-effort GC of expired records. May be a no-op when the backend has TTL. */
@@ -485,6 +490,11 @@ export class FileOAuthStore implements OAuthStore {
         if (!rec) return undefined;
         if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
         return rec;
+    }
+
+    async setAuthRequestPrincipal(id: string, principalId: string): Promise<void> {
+        const rec = this.authRequests.get(id);
+        if (rec) rec.principalId = principalId;
     }
 
     async consumeAuthRequest(id: string, ttlSec: number): Promise<AuthRequestRecord | undefined> {

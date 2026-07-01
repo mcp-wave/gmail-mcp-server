@@ -21,7 +21,6 @@ import { createStore } from './store.js';
 import { GmailOAuthProvider } from './provider.js';
 import { GmailClientCache, exchangeGoogleCode, buildGoogleAuthUrl, ReauthRequiredError } from './google.js';
 import type { OAuthStore } from './store.js';
-import { SESSION_COOKIE, readSessionCookie } from './cookies.js';
 import { rejectedAllowlistEntry } from '../send-policy.js';
 import type { PrincipalSession, Account, ResolveSession, SendPolicy } from '../session.js';
 
@@ -92,11 +91,13 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
         try {
             const identity = await exchangeGoogleCode(config, code);
 
-            // `state` is always a one-time link ticket now. It carries:
-            //  - a principalId  → link this account to an existing principal;
-            //    none → first connect: create the principal + a browser session.
-            //  - an authRequestId → started from the manage/setup screen; return
-            //    there. Otherwise it was the in-chat link tool → show a success page.
+            // `state` is always a one-time link ticket. It carries:
+            //  - a principalId  → link this account to that existing principal
+            //    (the manage-page "Add account" or the in-chat link tool);
+            //    none → this is the sign-in that ESTABLISHES the principal for
+            //    the authRequest (bound to it, never to an ambient cookie).
+            //  - an authRequestId → started from the manage/setup screen; bind +
+            //    return there. Otherwise (in-chat link) → show a success page.
             const ticket = await provider.consumeLinkTicket(state);
             if (!ticket) {
                 res.status(400).send('This sign-in link has expired. Please reconnect from your client.');
@@ -104,14 +105,23 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
             }
 
             if (ticket.principalId) {
+                // Adding/linking an account to an already-established principal.
                 await provider.linkGoogleAccount(ticket.principalId, identity);
-            } else {
-                const principalId = await provider.ensurePrincipal(identity);
-                const sessionId = await provider.createSession(principalId);
-                setSessionCookie(res, sessionId, config);
+                if (ticket.authRequestId) {
+                    res.redirect(`${config.baseUrl}/manage?req=${encodeURIComponent(ticket.authRequestId)}`);
+                    return;
+                }
+                res.status(200).send(linkedAccountPage(identity.email));
+                return;
             }
 
+            // First sign-in for this authorize request: find/create the principal
+            // for whoever actually logged in, and bind it to THIS request. This is
+            // what makes different claude.ai accounts (same browser) land on their
+            // own principal instead of an ambient session.
+            const principalId = await provider.ensurePrincipal(identity);
             if (ticket.authRequestId) {
+                await store.setAuthRequestPrincipal(ticket.authRequestId, principalId);
                 res.redirect(`${config.baseUrl}/manage?req=${encodeURIComponent(ticket.authRequestId)}`);
                 return;
             }
@@ -138,10 +148,13 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
     // --- Account management surface (shown during (re)connect) -------------
     const form = express.urlencoded({ extended: false });
 
-    const sessionPrincipal = async (req: Request): Promise<string | undefined> => {
-        const sid = readSessionCookie(req);
-        const sess = sid ? await store.getSession(sid, config.sessionTtlSec) : undefined;
-        return sess?.principalId;
+    // The principal is read from the authorize request itself (bound by the
+    // in-flow Google login), NOT from an ambient browser cookie. Possession of
+    // the high-entropy, short-lived reqId is the capability for that flow.
+    const reqPrincipal = async (reqId: string | undefined): Promise<string | undefined> => {
+        if (!reqId) return undefined;
+        const ar = await store.getAuthRequest(reqId, config.authRequestTtlSec);
+        return ar?.principalId;
     };
 
     // Setup/manage page: shown on EVERY connect. Lists linked accounts with per-
@@ -154,7 +167,7 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
             res.status(400).send('This authorization request has expired. Please reconnect from your client.');
             return;
         }
-        const principalId = await sessionPrincipal(req);
+        const principalId = await reqPrincipal(reqId);
         if (!principalId) {
             // No session — identify the user with Google first, then return here.
             const ticket = await provider.createLinkTicket(undefined, reqId);
@@ -167,7 +180,7 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
     // Add account: start a Google sign-in (account chooser) bound to this request.
     app.get('/manage/add', async (req: Request, res: Response) => {
         const reqId = req.query.req as string | undefined;
-        const principalId = await sessionPrincipal(req);
+        const principalId = await reqPrincipal(reqId);
         if (!reqId || !principalId) {
             res.status(400).send('Invalid request. Please reconnect from your client.');
             return;
@@ -180,7 +193,7 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
     app.post('/manage/remove', form, async (req: Request, res: Response) => {
         const reqId = req.body?.req as string | undefined;
         const sub = req.body?.sub as string | undefined;
-        const principalId = await sessionPrincipal(req);
+        const principalId = await reqPrincipal(reqId);
         if (!reqId || !sub || !principalId) {
             res.status(400).send('Invalid request.');
             return;
@@ -198,7 +211,7 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
     app.post('/manage/account-settings', form, async (req: Request, res: Response) => {
         const reqId = req.body?.req as string | undefined;
         const sub = req.body?.sub as string | undefined;
-        const principalId = await sessionPrincipal(req);
+        const principalId = await reqPrincipal(reqId);
         if (!reqId || !sub || !principalId) {
             res.status(400).send('Invalid request.');
             return;
@@ -221,7 +234,7 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
     // Continue: finish the connection — issue our auth code back to the client.
     app.post('/manage/continue', form, async (req: Request, res: Response) => {
         const reqId = req.body?.req as string | undefined;
-        const principalId = await sessionPrincipal(req);
+        const principalId = await reqPrincipal(reqId);
         if (!reqId || !principalId) {
             res.status(400).send('Invalid request. Please reconnect from your client.');
             return;
@@ -327,15 +340,6 @@ function linkedAccountPage(email: string): string {
 </body></html>`;
 }
 
-function setSessionCookie(res: Response, sessionId: string, config: HttpConfig): void {
-    res.cookie(SESSION_COOKIE, sessionId, {
-        httpOnly: true,
-        secure: config.issuerUrl.protocol === 'https:',
-        sameSite: 'lax',
-        path: '/',
-        maxAge: config.sessionTtlSec * 1000,
-    });
-}
 
 interface ManageAccount {
     sub: string;

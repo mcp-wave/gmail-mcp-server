@@ -223,6 +223,44 @@ describe('GmailOAuthProvider full flow', () => {
         expect((auth.extra as any).principalId).toBe(principalId);
     });
 
+    it('binds each authorize request to its OWN principal (no cross-request/cookie bleed)', async () => {
+        const IDENTITY_B: GoogleIdentity = {
+            sub: 'google-sub-2', email: 'b@example.com',
+            refreshToken: 'rt-b', scopeNames: ['gmail.modify'],
+        };
+        const park = async () => {
+            let captured = '';
+            const res = { redirect: (u: string) => { captured = u; } } as any;
+            await provider.authorize(CLIENT, {
+                state: 's', scopes: ['gmail'], redirectUri: CLIENT.redirect_uris[0],
+                codeChallenge: CHALLENGE, resource: new URL(RESOURCE),
+            }, res);
+            return new URL(captured).searchParams.get('req')!;
+        };
+        // Two separate connections (e.g. two claude.ai accounts in one browser).
+        const reqA = await park();
+        const reqB = await park();
+
+        // Each is signed in as a different Google identity, bound to its request.
+        const pA = await provider.ensurePrincipal(IDENTITY);
+        await store.setAuthRequestPrincipal(reqA, pA);
+        const pB = await provider.ensurePrincipal(IDENTITY_B);
+        await store.setAuthRequestPrincipal(reqB, pB);
+        expect(pA).not.toBe(pB);
+
+        // The manage page reads the principal from the request, not an ambient cookie.
+        expect((await store.getAuthRequest(reqA, 3600))?.principalId).toBe(pA);
+        expect((await store.getAuthRequest(reqB, 3600))?.principalId).toBe(pB);
+
+        // Finalizing each yields a token bound to its OWN principal.
+        const finA = await provider.finalizeAuthorization(reqA, (await store.getAuthRequest(reqA, 3600))!.principalId!);
+        const finB = await provider.finalizeAuthorization(reqB, (await store.getAuthRequest(reqB, 3600))!.principalId!);
+        const tA = await provider.exchangeAuthorizationCode(CLIENT, finA.code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
+        const tB = await provider.exchangeAuthorizationCode(CLIENT, finB.code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));
+        expect((await provider.verifyAccessToken(tA.access_token)).extra!.principalId).toBe(pA);
+        expect((await provider.verifyAccessToken(tB.access_token)).extra!.principalId).toBe(pB);
+    });
+
     it('reuses the existing principal when the same primary reconnects', async () => {
         const c1 = await connect(provider);
         const t1 = await provider.exchangeAuthorizationCode(CLIENT, c1.code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE));

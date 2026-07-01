@@ -339,6 +339,10 @@ export class FirestoreOAuthStore implements OAuthStore {
         return stripMeta(rec) as AuthRequestRecord;
     }
 
+    async setAuthRequestPrincipal(id: string, principalId: string): Promise<void> {
+        await this.db.collection(C.authRequests).doc(id).set({ principalId }, { merge: true });
+    }
+
     async consumeAuthRequest(id: string, ttlSec: number): Promise<AuthRequestRecord | undefined> {
         const ref = this.db.collection(C.authRequests).doc(id);
         return this.db.runTransaction(async (tx) => {

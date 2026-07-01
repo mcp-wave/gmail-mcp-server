@@ -24,7 +24,6 @@ import type { HttpConfig } from './config.js';
 import { generateToken } from './store.js';
 import type { OAuthStore } from './store.js';
 import { buildGoogleAuthUrl, type GoogleIdentity } from './google.js';
-import { readSessionCookie } from './cookies.js';
 
 function nowSec(): number {
     return Math.floor(Date.now() / 1000);
