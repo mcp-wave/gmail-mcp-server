@@ -8,11 +8,14 @@
 
 import type { SendPolicy } from './session.js';
 
+/** Per-account context handed to the tool dispatch. */
 export type SendContext = {
     ownEmail: string;
     policy?: SendPolicy;
     // Persist newly-approved recipients to this account's allowlist (hosted only).
     persistAllow?: (entries: string[]) => Promise<void>;
+    // Invoked when Google reports this account's grant is dead (invalid_grant).
+    onInvalidGrant?: () => Promise<void>;
 };
 
 /** Extract the bare lowercase address from a "Name <a@b.com>" or "a@b.com" value. */

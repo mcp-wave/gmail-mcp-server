@@ -470,5 +470,11 @@ async function buildPrincipalSession(
             await store.setSendPolicy(sub, policy);
             cache.evict(sub); // rebuild with the new policy next request
         },
+        handleInvalidGrant: async (sub: string) => {
+            // Google says this grant is dead (revoked, or expired — refresh tokens
+            // last only 7 days while the OAuth app is External+Testing). Drop the
+            // cached client and the stored grant so the user reconnects cleanly.
+            await cache.handleInvalidGrant(sub);
+        },
     };
 }

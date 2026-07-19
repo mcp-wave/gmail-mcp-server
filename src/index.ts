@@ -307,6 +307,20 @@ async function elicitConfirm(server: Server, message: string): Promise<ElicitOut
     ]);
 }
 
+/**
+ * Does this googleapis error mean the account's Google grant is dead?
+ * `invalid_grant` is returned when the refresh token has been revoked or has
+ * expired (Google expires refresh tokens after 7 days while an OAuth app is
+ * External + Testing). No amount of retrying/refreshing recovers it — the user
+ * must re-authorize.
+ */
+function isInvalidGrantError(err: any): boolean {
+    const data = err?.response?.data;
+    if (data?.error === 'invalid_grant') return true;
+    const msg = String(err?.message || data?.error || '').toLowerCase();
+    return msg.includes('invalid_grant') || msg.includes('token has been expired or revoked');
+}
+
 // Per-account send policy enforcement (logic in ./send-policy.ts).
 function sendBlockedError(disallowed: string[]): { content: { type: string; text: string }[] } {
     return errText(
@@ -2127,6 +2141,17 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                     throw new Error(`Unknown tool: ${name}`);
             }
         } catch (error: any) {
+            // A dead Google grant (revoked by the user, or expired — refresh tokens
+            // only last 7 days while the OAuth app is External+Testing) surfaces as
+            // invalid_grant. Clear the stale client/grant and tell the user to
+            // reconnect, instead of failing opaquely forever.
+            if (isInvalidGrantError(error)) {
+                try { await sendCtx.onInvalidGrant?.(); } catch { /* best effort */ }
+                return errText(
+                    `Error: Google access for ${sendCtx.ownEmail} has expired or been revoked (invalid_grant). ` +
+                    `Reconnect the connector to re-authorize this mailbox.`,
+                );
+            }
             return {
                 content: [
                     {
@@ -2179,6 +2204,9 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                         dangerouslyAllowAll: cur.dangerouslyAllowAll,
                     });
                 }
+                : undefined,
+            onInvalidGrant: session.handleInvalidGrant
+                ? () => session.handleInvalidGrant!(a.sub)
                 : undefined,
         });
 

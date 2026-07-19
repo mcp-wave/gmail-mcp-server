@@ -38,6 +38,9 @@ export type PrincipalSession = {
     unlinkAccount?: (sub: string) => Promise<void>;
     // Persist a per-account send policy (hosted only).
     setSendPolicy?: (sub: string, policy: SendPolicy) => Promise<void>;
+    // Called when Google reports the account's grant is dead (invalid_grant):
+    // drop the cached client and the stored grant so the user is told to reconnect.
+    handleInvalidGrant?: (sub: string) => Promise<void>;
 };
 
 export type ResolveSession = (extra?: any) => Promise<PrincipalSession> | PrincipalSession;
