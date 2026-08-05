@@ -300,7 +300,20 @@ The MCP endpoint is **stateless** (MCP 2025-11-25 Streamable HTTP). Sessions are
 
 In practice that means a redeploy or a restart does not strand connected clients on a session id that no longer exists, and any instance can serve any request.
 
-**Scaling out.** With `STORE_BACKEND=firestore`, grants and tokens are shared, so multiple instances work. One caveat: when the server asks the user a question mid-call (the send-policy prompt, the permanent-delete confirmation), the answer arrives as a separate HTTP request and has to reach the instance that asked. Turn on session affinity at the load balancer (`gcloud run deploy --session-affinity` on Cloud Run) so it does. Without affinity, everything else still works and those prompts fail closed: the send is blocked rather than silently allowed.
+**Scaling out.** Set `STORE_BACKEND=firestore` (the default on Cloud Run) and run as many instances as you like behind a plain round-robin load balancer. No session affinity, no sticky routing.
+
+That includes the prompts the server raises mid-call, the send-policy gate and the permanent-delete confirmation. Those are the one thing statelessness makes hard: the answer arrives as a separate HTTP request and can land on any instance, not the one holding the open call. Firestore carries it across. The asking instance records the request it is waiting on, whichever instance receives the answer publishes it against that record, and the asking instance is woken. Answers are encrypted with `TOKEN_ENCRYPTION_KEY` in transit through the store, and only the connection that was asked can answer.
+
+With `STORE_BACKEND=file` that hand-off is in-process, which is all a single-process deployment needs.
+
+**Firestore TTL policies.** Expiring records carry an `expireAt` timestamp. Every read re-checks expiry, so correctness never depends on deletion, but configure a TTL policy per collection to keep the database from growing without bound:
+
+```bash
+for c in oauth_pending_auths oauth_auth_codes oauth_access_tokens oauth_refresh_tokens \
+         oauth_link_tickets oauth_sessions oauth_auth_requests mcp_client_requests; do
+  gcloud firestore fields ttls update expireAt --collection-group="$c" --enable-ttl
+done
+```
 
 > **Security note.** Remote mode is a real multi-tenant service. Run it behind HTTPS, keep `TOKEN_ENCRYPTION_KEY` secret and stable, and treat `~/.gmail-mcp/oauth-store.json` as sensitive (it holds encrypted grants). The file-backed store is single-process; use the Firestore backend to run more than one instance. If a user revokes access in their Google account, they reconnect the connector to refresh the grant.
 

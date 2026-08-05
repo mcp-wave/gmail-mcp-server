@@ -19,8 +19,8 @@
 //
 // The fix
 // -------
-// Keep a process-local registry of the requests we have sent to a client and who
-// is waiting for each answer. Two details make it safe:
+// Keep a registry of the requests we have sent to a client and who is waiting
+// for each answer. Three details make it work:
 //
 //   - Ids are rewritten on the way out. Each Server numbers its own requests from
 //     zero, so two concurrent tool calls would both send id 0; an unguessable
@@ -30,15 +30,14 @@
 //   - Answers are bound to the principal that asked. Only the connection that
 //     triggered the elicitation can answer it, so one authenticated caller can
 //     never approve another caller's send.
-//
-// Scope: this is per-process. A single answer must reach the instance holding the
-// open stream, which is inherent to server -> client requests over HTTP and is
-// unchanged from the session-based transport. Everything else in the endpoint is
-// genuinely stateless.
+//   - Answers that land on another instance are relayed. POST #2 can be routed
+//     anywhere behind a load balancer, so a token nobody here is waiting on is
+//     offered to the relay, which wakes whichever instance is. See relay.ts.
 
 import { randomUUID } from 'crypto';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { JSONRPCMessage, RequestId } from '@modelcontextprotocol/sdk/types.js';
+import { MemoryRelay, type ClientRequestRelay } from './relay.js';
 
 /** A request we are sending to the client (has both a method and an id). */
 function isOutboundRequest(message: unknown): message is JSONRPCMessage & { id: RequestId; method: string } {
@@ -62,23 +61,32 @@ interface Pending {
     /** The id the SDK generated, which it will match the reply against. */
     originalId: RequestId;
     transport: Transport;
+    /** Withdraws the relay's claim on this token. Safe to call more than once. */
+    withdraw: () => void;
 }
 
 /**
  * Registry of in-flight server -> client requests, keyed by a token that is
- * unique across every concurrent request this process is handling.
+ * unique across every concurrent request. Backed by a relay so an answer that
+ * arrives at another instance still reaches the one that asked.
  */
 export class ClientRequestBridge {
     private readonly pending = new Map<string, Pending>();
+    private readonly relay: ClientRequestRelay;
 
-    /** How many answers we are currently waiting on (tests / diagnostics). */
+    constructor(relay: ClientRequestRelay = new MemoryRelay()) {
+        this.relay = relay;
+    }
+
+    /** How many answers this instance is waiting on (tests / diagnostics). */
     get size(): number {
         return this.pending.size;
     }
 
     /**
      * Watch a transport's outbound traffic: every request it sends to the client
-     * leaves with a unique token as its id and is registered here.
+     * leaves with a unique token as its id, is registered here, and is announced
+     * on the relay before the question is actually sent.
      *
      * Returns a cleanup function that forgets everything this transport is still
      * waiting on. Call it when the HTTP response closes, so an unanswered
@@ -91,46 +99,91 @@ export class ClientRequestBridge {
         transport.send = async (message: JSONRPCMessage, options?: Parameters<Transport['send']>[1]) => {
             if (!isOutboundRequest(message)) return send(message, options);
             const token = `srv-${randomUUID()}`;
-            this.pending.set(token, { principalId, originalId: message.id, transport });
+            const pending: Pending = {
+                principalId,
+                originalId: message.id,
+                transport,
+                withdraw: () => {},
+            };
+            this.pending.set(token, pending);
+            // Announce before sending: an answer must never be able to arrive
+            // before there is somewhere for it to land. If the relay is having a
+            // bad day, carry on without it rather than failing the gate outright,
+            // since an answer routed back to this instance still lands.
+            try {
+                pending.withdraw = await this.relay.register(token, principalId, (answer) =>
+                    this.deliverLocal(token, answer),
+                );
+            } catch (err: any) {
+                console.error('Client request relay unavailable:', err?.message || err);
+            }
             owned.add(token);
             return send({ ...message, id: token } as JSONRPCMessage, options);
         };
 
         return () => {
-            for (const token of owned) this.pending.delete(token);
+            for (const token of owned) {
+                this.pending.get(token)?.withdraw();
+                this.pending.delete(token);
+            }
             owned.clear();
         };
     }
 
     /**
-     * Hand an incoming POST body to whoever is waiting for it.
+     * Hand an incoming POST body to whoever is waiting for it, here or on
+     * another instance.
      *
-     * Returns true when every message in the body was delivered, in which case
-     * the caller answers 202 and never builds an MCP server for the request.
-     * Returns false for anything else (including a reply we do not own, or one
-     * belonging to a different principal) so it takes the normal path.
+     * Returns true when every message in the body was delivered or accepted for
+     * relay, in which case the caller answers 202 and never builds an MCP server
+     * for the request. Returns false for anything else (ordinary traffic, a
+     * token nobody is waiting on, or an answer from a different principal) so it
+     * takes the normal path.
      */
-    deliver(body: unknown, principalId: string): boolean {
+    async deliver(body: unknown, principalId: string): Promise<boolean> {
         const messages = Array.isArray(body) ? body : [body];
         if (messages.length === 0) return false;
 
-        const matched: Array<{ message: Record<string, unknown>; token: string; pending: Pending }> = [];
+        // Every message has to be an answer, or this is ordinary traffic.
+        const replies: Array<{ token: string; message: Record<string, unknown> }> = [];
         for (const message of messages) {
             if (!isClientReply(message)) return false;
             const token = message.id;
-            if (typeof token !== 'string') return false;
-            const pending = this.pending.get(token);
-            // Not ours, already answered, or another connection's elicitation.
-            if (!pending || pending.principalId !== principalId) return false;
-            matched.push({ message: message as Record<string, unknown>, token, pending });
+            if (typeof token !== 'string' || !token.startsWith('srv-')) return false;
+            replies.push({ token, message: message as Record<string, unknown> });
         }
 
-        for (const { message, token, pending } of matched) {
-            this.pending.delete(token);
-            const onmessage = pending.transport.onmessage;
-            if (!onmessage) continue;
-            onmessage({ ...message, id: pending.originalId } as JSONRPCMessage);
-        }
+        // Anything we are waiting on here is settled without touching the relay.
+        // That is the common case: same instance, or a load balancer with
+        // affinity. Only genuinely misrouted answers pay for the round trip.
+        const results = await Promise.all(
+            replies.map(async ({ token, message }) => {
+                const pending = this.pending.get(token);
+                if (pending) {
+                    if (pending.principalId !== principalId) return false;
+                    return this.deliverLocal(token, message);
+                }
+                try {
+                    return await this.relay.publish(token, principalId, message);
+                } catch (err: any) {
+                    console.error('Client request relay unavailable:', err?.message || err);
+                    return false;
+                }
+            }),
+        );
+        return results.every(Boolean);
+    }
+
+    /** Deliver an answer into the transport that is waiting for it, once. */
+    private deliverLocal(token: string, message: unknown): boolean {
+        const pending = this.pending.get(token);
+        if (!pending) return false;
+        this.pending.delete(token);
+        // Drop the relay's claim too, so a replayed answer finds nothing anywhere.
+        pending.withdraw();
+        const onmessage = pending.transport.onmessage;
+        if (!onmessage) return false;
+        onmessage({ ...(message as Record<string, unknown>), id: pending.originalId } as JSONRPCMessage);
         return true;
     }
 }

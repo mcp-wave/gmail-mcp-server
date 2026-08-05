@@ -14,8 +14,9 @@
 //     unsolicited notifications, so there is nothing to stream. The spec
 //     explicitly allows 405 here.
 //   - DELETE answers 405 as well: there is no session to tear down.
-//   - Requests the server makes of the client (elicitation) still work; see
-//     ClientRequestBridge for how the answers find their way home.
+//   - Requests the server makes of the client (elicitation) still work, on any
+//     instance; see ClientRequestBridge and relay.ts for how the answers find
+//     their way home.
 
 import type { RequestHandler, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
@@ -23,6 +24,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { ClientRequestBridge } from './client-requests.js';
+import type { ClientRequestRelay } from './relay.js';
 import type { ResolveSession } from '../session.js';
 
 /** Builds the MCP Server with all tool handlers (implemented in index.ts). */
@@ -51,15 +53,17 @@ function jsonRpcError(res: Response, status: number, code: number, message: stri
 export function createStatelessMcpEndpoint(
     createMcpServer: McpServerFactory,
     resolveSession: ResolveSession,
+    relay?: ClientRequestRelay,
 ): StatelessMcpEndpoint {
-    const bridge = new ClientRequestBridge();
+    const bridge = new ClientRequestBridge(relay);
 
     const post: RequestHandler = async (req, res) => {
         const principalId = principalOf(req);
 
         // An answer to something we asked (elicitation) belongs to the request
-        // that is still waiting for it, not to a fresh server.
-        if (bridge.deliver(req.body, principalId)) {
+        // that is still waiting for it, here or on another instance, not to a
+        // fresh server.
+        if (await bridge.deliver(req.body, principalId)) {
             res.status(202).end();
             return;
         }

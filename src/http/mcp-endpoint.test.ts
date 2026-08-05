@@ -17,6 +17,7 @@ import {
     ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { createStatelessMcpEndpoint } from './mcp-endpoint.js';
+import { MemoryRelay, type ClientRequestRelay } from './relay.js';
 import type { PrincipalSession, ResolveSession } from '../session.js';
 
 const SESSION: PrincipalSession = {
@@ -70,31 +71,40 @@ function createTestMcpServer(): McpServer {
     return server;
 }
 
-let server: http.Server;
-let url: URL;
-
-beforeAll(async () => {
+/** One server instance of the endpoint, optionally sharing a relay with others. */
+async function startInstance(relay?: ClientRequestRelay): Promise<{ server: http.Server; port: number }> {
     const app = express();
     // Stand in for requireBearerAuth: the endpoint only needs the principal.
     app.use((req, _res, next) => {
         (req as any).auth = { token: 't', clientId: 'c', scopes: ['gmail'], extra: { principalId: 'principal-1' } };
         next();
     });
-    const mcp = createStatelessMcpEndpoint(createTestMcpServer, resolveSession);
+    const mcp = createStatelessMcpEndpoint(createTestMcpServer, resolveSession, relay);
     app.post('/mcp', express.json(), mcp.post);
     app.get('/mcp', mcp.methodNotAllowed);
     app.delete('/mcp', mcp.methodNotAllowed);
 
-    server = http.createServer(app);
+    const server = http.createServer(app);
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    url = new URL(`http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`);
+    return { server, port: (server.address() as AddressInfo).port };
+}
+
+const stop = (server: http.Server) => new Promise<void>((resolve) => server.close(() => resolve()));
+
+let server: http.Server;
+let url: URL;
+
+beforeAll(async () => {
+    const instance = await startInstance();
+    server = instance.server;
+    url = new URL(`http://127.0.0.1:${instance.port}/mcp`);
 });
 
 afterAll(async () => {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await stop(server);
 });
 
-async function connect(elicitAnswer?: { action: string; content?: unknown }) {
+async function connect(elicitAnswer?: { action: string; content?: unknown }, at: URL = url) {
     const client = new Client(
         { name: 'test-client', version: '0.0.0' },
         { capabilities: elicitAnswer ? { elicitation: {} } : {} },
@@ -102,7 +112,7 @@ async function connect(elicitAnswer?: { action: string; content?: unknown }) {
     if (elicitAnswer) {
         client.setRequestHandler(ElicitRequestSchema, async () => elicitAnswer as any);
     }
-    const transport = new StreamableHTTPClientTransport(url);
+    const transport = new StreamableHTTPClientTransport(at);
     await client.connect(transport);
     return { client, transport };
 }
@@ -184,5 +194,101 @@ describe('stateless MCP endpoint', () => {
     it('reports no leaked in-flight requests once everything has closed', async () => {
         const mcp = createStatelessMcpEndpoint(createTestMcpServer, resolveSession);
         expect(mcp.pendingClientRequests).toBe(0);
+    });
+});
+
+/**
+ * A deliberately hostile load balancer: calls go to one instance, and every
+ * JSON-RPC answer goes to the other. This is the worst case a deploy without
+ * session affinity can produce, so if elicitation survives here it survives
+ * anywhere.
+ */
+function crossRoutingBalancer(callPort: number, answerPort: number): http.Server {
+    return http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+            const body = Buffer.concat(chunks);
+            let isAnswer = false;
+            try {
+                const parsed = JSON.parse(body.toString() || '{}');
+                isAnswer = !!parsed && !parsed.method && ('result' in parsed || 'error' in parsed);
+            } catch {
+                // Not JSON: treat as a call.
+            }
+            const port = isAnswer ? answerPort : callPort;
+            const headers = { ...req.headers, host: `127.0.0.1:${port}`, 'content-length': String(body.length) };
+            const upstream = http.request(
+                { host: '127.0.0.1', port, path: req.url, method: req.method, headers },
+                (ures) => {
+                    res.writeHead(ures.statusCode ?? 502, ures.headers);
+                    ures.pipe(res);
+                },
+            );
+            upstream.on('error', () => {
+                if (!res.headersSent) res.writeHead(502);
+                res.end();
+            });
+            upstream.end(body);
+        });
+    });
+}
+
+describe('stateless MCP endpoint across instances', () => {
+    let a: { server: http.Server; port: number };
+    let b: { server: http.Server; port: number };
+    let balancer: http.Server;
+    let balancedUrl: URL;
+
+    beforeAll(async () => {
+        // The relay is the only thing the two instances share, exactly as
+        // Firestore would be in a real deploy.
+        const relay = new MemoryRelay();
+        a = await startInstance(relay);
+        b = await startInstance(relay);
+
+        balancer = crossRoutingBalancer(a.port, b.port);
+        await new Promise<void>((resolve) => balancer.listen(0, '127.0.0.1', resolve));
+        balancedUrl = new URL(`http://127.0.0.1:${(balancer.address() as AddressInfo).port}/mcp`);
+    });
+
+    afterAll(async () => {
+        await Promise.all([stop(balancer), stop(a.server), stop(b.server)]);
+    });
+
+    it('completes an elicitation answered by the instance that never asked', async () => {
+        const { client } = await connect({ action: 'accept', content: { choice: 'yes' } }, balancedUrl);
+        const result = await client.callTool({ name: 'confirm', arguments: {} });
+        expect((result.content as any)[0].text).toBe('accept:yes');
+        await client.close();
+    });
+
+    it('carries a decline across instances too', async () => {
+        const { client } = await connect({ action: 'decline' }, balancedUrl);
+        const result = await client.callTool({ name: 'confirm', arguments: {} });
+        expect((result.content as any)[0].text).toBe('decline:');
+        await client.close();
+    });
+
+    it('keeps two concurrent cross-instance elicitations apart', async () => {
+        const yes = await connect({ action: 'accept', content: { choice: 'yes' } }, balancedUrl);
+        const no = await connect({ action: 'accept', content: { choice: 'no' } }, balancedUrl);
+
+        const [first, second] = await Promise.all([
+            yes.client.callTool({ name: 'confirm', arguments: {} }),
+            no.client.callTool({ name: 'confirm', arguments: {} }),
+        ]);
+        expect((first.content as any)[0].text).toBe('accept:yes');
+        expect((second.content as any)[0].text).toBe('accept:no');
+
+        await yes.client.close();
+        await no.client.close();
+    });
+
+    it('still serves ordinary calls whichever instance takes them', async () => {
+        const { client } = await connect(undefined, balancedUrl);
+        const result = await client.callTool({ name: 'ping', arguments: {} });
+        expect((result.content as any)[0].text).toBe('pong');
+        await client.close();
     });
 });

@@ -14,6 +14,7 @@ import type { Request, Response } from 'express';
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { createStatelessMcpEndpoint, type McpServerFactory } from './mcp-endpoint.js';
+import { createRelay } from './relay.js';
 import { loadHttpConfig, type HttpConfig } from './config.js';
 import { createStore } from './store.js';
 import { GmailOAuthProvider } from './provider.js';
@@ -46,14 +47,15 @@ function originGuard(config: HttpConfig) {
 export async function startHttpServer(createMcpServer: McpServerFactory): Promise<void> {
     const config = loadHttpConfig();
     const store = await createStore(config);
+    const relay = await createRelay(config);
     const provider = new GmailOAuthProvider(config, store);
     const cache = new GmailClientCache(config, store);
 
     // Periodic GC of expired tokens / codes / pending auths (no-op on Firestore).
-    const sweep = setInterval(
-        () => void store.sweep(config.pendingAuthTtlSec, config.authCodeTtlSec),
-        5 * 60 * 1000,
-    );
+    const sweep = setInterval(() => {
+        void store.sweep(config.pendingAuthTtlSec, config.authCodeTtlSec);
+        void relay.sweep();
+    }, 5 * 60 * 1000);
     sweep.unref?.();
 
     // Resolve the caller's principal (and all its linked Gmail accounts) from the
@@ -262,7 +264,7 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
 
     // Stateless Streamable HTTP: no session id, a fresh transport and MCP Server
     // per request, nothing held between requests.
-    const mcp = createStatelessMcpEndpoint(createMcpServer, resolveSession);
+    const mcp = createStatelessMcpEndpoint(createMcpServer, resolveSession, relay);
     app.post('/mcp', origin, bearer, express.json(), mcp.post);
     // No standalone notification stream and no session to delete.
     app.get('/mcp', origin, bearer, mcp.methodNotAllowed);
