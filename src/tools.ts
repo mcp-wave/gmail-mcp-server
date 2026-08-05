@@ -106,6 +106,14 @@ export const BatchDeleteEmailsSchema = z.object({
   batchSize: z.number().optional().default(50).describe("Number of messages to process in each batch (default: 50)"),
 });
 
+export const TrashEmailSchema = z.object({
+  messageId: z.string().describe("ID of the email message to move to Trash"),
+});
+export const BatchTrashEmailsSchema = z.object({
+  messageIds: z.array(z.string()).describe("List of message IDs to move to Trash"),
+  batchSize: z.number().optional().default(50).describe("Number of messages to process in each batch (default: 50)"),
+});
+
 export const CreateFilterSchema = z.object({
   criteria: z.object({
     from: z.string().optional().describe("Sender email address to match"),
@@ -194,7 +202,10 @@ export const ReplyAllSchema = z.object({
   htmlBody: z.string().optional().describe("HTML version of the reply body"),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
   attachments: z.array(z.string()).optional().describe("List of file paths to attach to the reply"),
+  from: z.string().optional().describe("Send the reply as this address (must be a configured send-as alias in Gmail settings). Defaults to the account's default send-as address. Use list_send_as to discover available aliases."),
 });
+
+export const ListSendAsSchema = z.object({});
 
 // Tool definition type
 export interface ToolAnnotations {
@@ -319,8 +330,22 @@ export const toolDefinitions: ToolDefinition[] = [
     annotations: { title: "Modify Email", destructiveHint: true, idempotentHint: true },
   },
   {
+    name: "trash_email",
+    description: "Moves an email to Trash (recoverable for 30 days). Prefer this over delete_email — delete_email is a permanent, irreversible delete.",
+    schema: TrashEmailSchema,
+    scopes: ["gmail.modify"],
+    annotations: { title: "Trash Email", destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "batch_trash_emails",
+    description: "Moves multiple emails to Trash (recoverable for 30 days). Prefer this over batch_delete_emails for clearing the inbox.",
+    schema: BatchTrashEmailsSchema,
+    scopes: ["gmail.modify"],
+    annotations: { title: "Batch Trash Emails", destructiveHint: false, idempotentHint: true },
+  },
+  {
     name: "delete_email",
-    description: "Permanently deletes an email",
+    description: "PERMANENTLY deletes an email (bypasses Trash, cannot be undone). Use trash_email instead unless permanent deletion is explicitly required.",
     schema: DeleteEmailSchema,
     scopes: ["gmail.modify"],
     annotations: { title: "Delete Email", destructiveHint: true },
@@ -348,7 +373,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "batch_delete_emails",
-    description: "Permanently deletes multiple emails in batches",
+    description: "PERMANENTLY deletes multiple emails (bypasses Trash, cannot be undone). Use batch_trash_emails instead unless permanent deletion is explicitly required.",
     schema: BatchDeleteEmailsSchema,
     scopes: ["gmail.modify"],
     annotations: { title: "Batch Delete Emails", destructiveHint: true },
@@ -405,6 +430,13 @@ export const toolDefinitions: ToolDefinition[] = [
     schema: GetFilterSchema,
     scopes: ["gmail.settings.basic"],
     annotations: { title: "Get Filter", readOnlyHint: true },
+  },
+  {
+    name: "list_send_as",
+    description: "Lists the send-as addresses (aliases) configured for the account, including which is the default and each one's verification status. Use the address as the 'from' parameter on send_email, draft_email, or reply_all to send as that alias.",
+    schema: ListSendAsSchema,
+    scopes: ["gmail.settings.basic"],
+    annotations: { title: "List Send-As Aliases", readOnlyHint: true },
   },
   {
     name: "create_filter",

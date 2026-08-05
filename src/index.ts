@@ -4,6 +4,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
     CallToolRequestSchema,
+    ElicitResultSchema,
     ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { google } from 'googleapis';
@@ -19,8 +20,10 @@ import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, get
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
 import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
-import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema } from "./tools.js";
+import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ListSendAsSchema, TrashEmailSchema, BatchTrashEmailsSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
+import type { Account, PrincipalSession, ResolveSession, SendPolicy } from "./session.js";
+import { disallowedRecipients, emailAddressOf, isPublicEmailDomain, rejectedAllowlistEntry, type SendContext } from "./send-policy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -54,6 +57,305 @@ interface EmailContent {
 // OAuth2 configuration
 let oauth2Client: OAuth2Client;
 let authorizedScopes: string[] = DEFAULT_SCOPES;
+
+// A per-request session: the Gmail client to use and the scopes it is authorized
+// for. resolveSession turns the transport's request context (`extra`, which
+// carries the validated bearer's AuthInfo in http mode) into one of these.
+// Tools that mutate a mailbox require an explicit `account` when more than one is
+// linked (the agent must never cross-write by accident). Everything not listed is
+// a read and fans out across all linked accounts by default.
+const WRITE_TOOLS = new Set([
+    'send_email', 'draft_email', 'send_draft', 'delete_draft', 'update_draft',
+    'modify_email', 'delete_email', 'batch_modify_emails', 'report_phishing',
+    'batch_report_phishing', 'batch_delete_emails', 'trash_email', 'batch_trash_emails',
+    'create_label', 'update_label',
+    'delete_label', 'get_or_create_label', 'create_filter', 'delete_filter',
+    'create_filter_from_template', 'reply_all', 'modify_thread',
+]);
+
+const errText = (text: string) => ({ content: [{ type: 'text', text }] });
+
+function unionScopes(accounts: Account[]): string[] {
+    const s = new Set<string>();
+    for (const a of accounts) for (const sc of a.scopeNames) s.add(sc);
+    return [...s];
+}
+
+function findAccount(session: PrincipalSession, selector: string): Account | undefined {
+    const sel = String(selector).trim().toLowerCase();
+    if (sel === 'primary') return session.accounts.find(a => a.primary) || session.accounts[0];
+    return session.accounts.find(a => a.email.toLowerCase() === sel || a.sub === selector);
+}
+
+function stripAccount(args: any): any {
+    if (!args || typeof args !== 'object') return args;
+    const { account, ...rest } = args;
+    void account;
+    return rest;
+}
+
+// Prepend an account header so multi-account read results are always attributable.
+function annotate(email: string, primary: boolean, result: any): any {
+    const header = { type: 'text', text: `=== ${email}${primary ? ' (primary)' : ''} ===` };
+    return { ...result, content: [header, ...(result?.content || [])] };
+}
+
+// `account` parameter injected into every Gmail tool's schema so the agent knows
+// it can target a mailbox (and must, for writes, when multiple are linked).
+const ACCOUNT_PARAM = {
+    account: {
+        type: 'string',
+        description:
+            'Which linked mailbox (email address) to act on. Reads: omit to search ALL linked accounts (results are labeled by account). Writes: required when more than one account is linked.',
+    },
+};
+
+function metaToolDefs(session: PrincipalSession): any[] {
+    const tools: any[] = [{
+        name: 'list_accounts',
+        description: 'List the Gmail accounts linked to this connection (email and which is primary).',
+        inputSchema: { type: 'object', properties: {} },
+    }];
+    if (session.linkAccount) {
+        tools.push({
+            name: 'link_account',
+            description: 'Link an additional Gmail account. Returns a sign-in link the user opens to authorize the new mailbox; afterwards it is available to all email tools.',
+            inputSchema: { type: 'object', properties: {} },
+        });
+        tools.push({
+            name: 'unlink_account',
+            description: 'Unlink a previously linked Gmail account by email address.',
+            inputSchema: { type: 'object', properties: { account: { type: 'string', description: 'Email address of the account to unlink.' } }, required: ['account'] },
+        });
+    }
+    if (session.setSendPolicy) {
+        tools.push({
+            name: 'get_send_policy',
+            description: "Show the outbound send policy (allowlist / dangerous flag) for each linked account. Sending to an account's own address is always allowed.",
+            inputSchema: { type: 'object', properties: { account: { type: 'string', description: 'Email of the account (optional; defaults to all).' } } },
+        });
+        tools.push({
+            name: 'allow_send_recipient',
+            description: 'Permanently allow an account to send to a recipient or domain (adds to its allowlist). Confirms with the user first. Use this when the user wants to whitelist someone for the future.',
+            inputSchema: { type: 'object', properties: { account: { type: 'string', description: 'Email of the sending account.' }, recipient: { type: 'string', description: 'Email address or domain to allow (e.g. boss@acme.com or acme.com).' } }, required: ['recipient'] },
+        });
+        tools.push({
+            name: 'disallow_send_recipient',
+            description: "Remove a recipient or domain from an account's send allowlist. Confirms with the user first.",
+            inputSchema: { type: 'object', properties: { account: { type: 'string', description: 'Email of the sending account.' }, recipient: { type: 'string', description: 'Email address or domain to remove.' } }, required: ['recipient'] },
+        });
+        tools.push({
+            name: 'set_dangerous_send',
+            description: 'Turn the "allow sending to anyone" blanket override on or off for an account. Strongly confirms with the user first.',
+            inputSchema: { type: 'object', properties: { account: { type: 'string', description: 'Email of the account.' }, enabled: { type: 'boolean', description: 'true = allow sending to anyone (no checks); false = restore the allowlist gate.' } }, required: ['enabled'] },
+        });
+    }
+    return tools;
+}
+
+async function metaListAccounts(session: PrincipalSession) {
+    const lines = session.accounts.map(
+        a => `- ${a.email}${a.primary ? ' (primary)' : ''}`,
+    );
+    return errText(`Linked accounts (${session.accounts.length}):\n${lines.join('\n')}`);
+}
+
+async function metaLinkAccount(session: PrincipalSession) {
+    if (!session.linkAccount) {
+        return errText('Linking additional accounts is only available on the hosted server.');
+    }
+    const url = await session.linkAccount();
+    return errText(
+        `To link another Gmail account, open this link and sign in with the account you want to add:\n${url}\n\nAfter you authorize, it becomes available to all email tools.`,
+    );
+}
+
+async function metaUnlinkAccount(session: PrincipalSession, args: any) {
+    if (!session.unlinkAccount) {
+        return errText('Unlinking is only available on the hosted server.');
+    }
+    const acct = args?.account ? findAccount(session, args.account) : undefined;
+    if (!acct) {
+        return errText(`Specify which account to unlink. Linked: ${session.accounts.map(a => a.email).join(', ')}`);
+    }
+    if (acct.primary) return errText('Cannot unlink the primary account.');
+    await session.unlinkAccount(acct.sub);
+    return errText(`Unlinked ${acct.email}.`);
+}
+
+// --- Send-policy management meta tools (hosted only) ------------------------
+
+function describePolicy(p?: SendPolicy): string {
+    if (p?.dangerouslyAllowAll) return 'DANGEROUS — may send to anyone';
+    if (p && p.allowlist.length) return `allowed: ${p.allowlist.join(', ')} (+ own address)`;
+    return 'own address only';
+}
+
+/** Resolve which account a settings tool targets. */
+function settingsAccount(session: PrincipalSession, args: any): Account | { error: string } {
+    if (args?.account) {
+        const a = findAccount(session, args.account);
+        return a || { error: `account "${args.account}" is not linked. Linked: ${session.accounts.map(x => x.email).join(', ')}` };
+    }
+    if (session.accounts.length === 1) return session.accounts[0];
+    return { error: `Specify which account: ${session.accounts.map(a => a.email).join(', ')}` };
+}
+
+async function metaGetSendPolicy(session: PrincipalSession, args: any) {
+    const accts = args?.account
+        ? session.accounts.filter(a => a === findAccount(session, args.account))
+        : session.accounts;
+    if (accts.length === 0) return errText('No matching account.');
+    const lines = accts.map(a => `- ${a.email}: ${describePolicy(a.sendPolicy)}`);
+    return errText(`Send policy (sending to an account's own address is always allowed):\n${lines.join('\n')}`);
+}
+
+async function metaAllowSender(session: PrincipalSession, server: Server, extra: any, args: any) {
+    if (!session.setSendPolicy) return errText('Send settings are only available on the hosted server.');
+    const acct = settingsAccount(session, args);
+    if ('error' in acct) return errText(`Error: ${acct.error}`);
+    const entry = String(args?.recipient || '').trim().toLowerCase();
+    if (!entry) return errText('Provide a recipient email address or domain to allow.');
+    const rejected = rejectedAllowlistEntry(entry);
+    if (rejected) return errText(`Error: ${rejected}`);
+    const confirm = await elicitConfirm(server, extra, `Always allow ${acct.email} to send to "${entry}"?`);
+    if (confirm.supported && confirm.choice !== 'yes') return errText('No change made.');
+    const cur = acct.sendPolicy || { allowlist: [], dangerouslyAllowAll: false };
+    const merged = Array.from(new Set([...cur.allowlist, entry]));
+    await session.setSendPolicy(acct.sub, { allowlist: merged, dangerouslyAllowAll: cur.dangerouslyAllowAll });
+    return errText(`Allowed "${entry}" for ${acct.email}. Now: ${describePolicy({ allowlist: merged, dangerouslyAllowAll: cur.dangerouslyAllowAll })}.`);
+}
+
+async function metaDisallowSender(session: PrincipalSession, server: Server, extra: any, args: any) {
+    if (!session.setSendPolicy) return errText('Send settings are only available on the hosted server.');
+    const acct = settingsAccount(session, args);
+    if ('error' in acct) return errText(`Error: ${acct.error}`);
+    const entry = String(args?.recipient || '').trim().toLowerCase();
+    if (!entry) return errText('Provide a recipient email address or domain to remove.');
+    const confirm = await elicitConfirm(server, extra, `Stop allowing ${acct.email} to send to "${entry}"?`);
+    if (confirm.supported && confirm.choice !== 'yes') return errText('No change made.');
+    const cur = acct.sendPolicy || { allowlist: [], dangerouslyAllowAll: false };
+    const filtered = cur.allowlist.filter(e => e !== entry);
+    await session.setSendPolicy(acct.sub, { allowlist: filtered, dangerouslyAllowAll: cur.dangerouslyAllowAll });
+    return errText(`Removed "${entry}" from ${acct.email}. Now: ${describePolicy({ allowlist: filtered, dangerouslyAllowAll: cur.dangerouslyAllowAll })}.`);
+}
+
+async function metaSetDangerous(session: PrincipalSession, server: Server, extra: any, args: any) {
+    if (!session.setSendPolicy) return errText('Send settings are only available on the hosted server.');
+    const acct = settingsAccount(session, args);
+    if ('error' in acct) return errText(`Error: ${acct.error}`);
+    const enabled = args?.enabled === true || args?.enabled === 'true' || args?.enabled === 'on';
+    const confirm = await elicitConfirm(
+        server,
+        extra,
+        enabled
+            ? `⚠️ Allow ${acct.email} to send email to ANYONE, with no recipient checks? This removes the send safety gate.`
+            : `Turn OFF "send to anyone" for ${acct.email} and restore the allowlist gate?`,
+    );
+    if (confirm.supported && confirm.choice !== 'yes') return errText('No change made.');
+    const cur = acct.sendPolicy || { allowlist: [], dangerouslyAllowAll: false };
+    await session.setSendPolicy(acct.sub, { allowlist: cur.allowlist, dangerouslyAllowAll: enabled });
+    return errText(`${acct.email}: "send to anyone" is now ${enabled ? 'ENABLED ⚠️' : 'disabled'}.`);
+}
+
+// --- Elicitation helpers ---------------------------------------------------
+// MCP elicitation lets the SERVER ask the user a question mid-tool-call (via the
+// client). Two details matter for the remote (stateless HTTP) transport:
+//
+//   - The question goes out through `extra.sendRequest`, which tags it as
+//     related to the tool call that raised it, so it travels on that call's own
+//     response stream. A bare server.request() is unrelated traffic and needs
+//     the standalone GET stream, which a stateless endpoint does not offer.
+//   - It does not go through server.elicitInput(), which refuses to send unless
+//     it saw the client advertise the capability during initialize. Over
+//     stateless HTTP that handshake happened on an earlier, separate request, so
+//     this instance has no record of it and every gate would fail closed. Asking
+//     anyway is safe: a client without elicitation answers with a JSON-RPC
+//     error, which lands in the catch below.
+
+const ELICIT_TIMEOUT_MS = 5 * 60 * 1000;
+
+type ElicitOutcome = { supported: true; choice: string | null } | { supported: false };
+
+/** Ask the user to pick one of `options` (value/label). Returns the chosen value. */
+async function elicitChoice(
+    server: Server,
+    extra: any,
+    message: string,
+    options: Array<{ value: string; label: string }>,
+): Promise<ElicitOutcome> {
+    // Known capabilities (stdio, where initialize ran against this instance) let
+    // us skip a doomed round trip. Unknown means stateless HTTP: just ask.
+    const clientCapabilities = server.getClientCapabilities();
+    if (clientCapabilities && !clientCapabilities.elicitation) return { supported: false };
+    if (typeof extra?.sendRequest !== 'function') return { supported: false };
+
+    try {
+        const res = await extra.sendRequest(
+            {
+                method: 'elicitation/create',
+                params: {
+                    mode: 'form',
+                    message,
+                    requestedSchema: {
+                        type: 'object',
+                        properties: {
+                            choice: {
+                                type: 'string',
+                                description: 'How to proceed.',
+                                enum: options.map((o) => o.value),
+                                enumNames: options.map((o) => o.label),
+                            },
+                        },
+                        required: ['choice'],
+                    },
+                },
+            },
+            ElicitResultSchema,
+            { timeout: ELICIT_TIMEOUT_MS },
+        );
+        if (res.action !== 'accept') return { supported: true, choice: null };
+        // Validate here rather than trusting the client: we are the ones acting
+        // on the answer, and anything outside the offered set means "no".
+        const c = (res.content as any)?.choice;
+        const chosen = options.some((o) => o.value === c) ? (c as string) : null;
+        return { supported: true, choice: chosen };
+    } catch {
+        // Client doesn't support elicitation (or it failed) — caller decides fallback.
+        return { supported: false };
+    }
+}
+
+/** Yes/no confirmation. Returns true only on an explicit "yes". */
+async function elicitConfirm(server: Server, extra: any, message: string): Promise<ElicitOutcome> {
+    return elicitChoice(server, extra, message, [
+        { value: 'yes', label: 'Yes, proceed' },
+        { value: 'no', label: 'No, cancel' },
+    ]);
+}
+
+/**
+ * Does this googleapis error mean the account's Google grant is dead?
+ * `invalid_grant` is returned when the refresh token has been revoked or has
+ * expired (Google expires refresh tokens after 7 days while an OAuth app is
+ * External + Testing). No amount of retrying/refreshing recovers it — the user
+ * must re-authorize.
+ */
+function isInvalidGrantError(err: any): boolean {
+    const data = err?.response?.data;
+    if (data?.error === 'invalid_grant') return true;
+    const msg = String(err?.message || data?.error || '').toLowerCase();
+    return msg.includes('invalid_grant') || msg.includes('token has been expired or revoked');
+}
+
+// Per-account send policy enforcement (logic in ./send-policy.ts).
+function sendBlockedError(disallowed: string[]): { content: { type: string; text: string }[] } {
+    return errText(
+        `Error: this account is not allowed to send to: ${disallowed.join(', ')}. ` +
+        `Create a draft instead (the user reviews and sends it), or the user can allow ` +
+        `these recipients on the connection's setup screen (by email or domain).`,
+    );
+}
 
 /**
  * Recursively extract email body content from MIME message parts
@@ -253,6 +555,15 @@ async function authenticate(scopes: string[]) {
 
 // Main function
 async function main() {
+    // Remote (claude.ai) multi-tenant mode: loaded lazily so stdio users never
+    // pull in Express / the OAuth stack. It manages its own per-user credentials
+    // and does not use the single local account loaded by loadCredentials().
+    if (process.argv[2] === 'http') {
+        const { startHttpServer } = await import('./http/server.js');
+        await startHttpServer(createMcpServer);
+        return;
+    }
+
     await loadCredentials();
 
     if (process.argv[2] === 'auth') {
@@ -284,9 +595,26 @@ async function main() {
         process.exit(0);
     }
 
-    // Initialize Gmail API
+    // stdio mode (default): a single Gmail client bound to the locally
+    // authenticated account, surfaced as a one-account principal.
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    const stdioSession: PrincipalSession = {
+        principalId: 'local',
+        accounts: [{ sub: 'local', email: 'me', primary: true, scopeNames: authorizedScopes }],
+        getClient: () => ({ gmail, authorizedScopes }),
+    };
+    const server = createMcpServer(() => stdioSession);
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+}
 
+/**
+ * Builds the MCP Server and registers tool handlers. Each request resolves a
+ * per-call session via resolveSession(extra) — for stdio that is the single
+ * local account; for http (multi-tenant) it is the caller's own Gmail client,
+ * derived from the validated bearer token.
+ */
+function createMcpServer(resolveSession: ResolveSession): Server {
     // Server implementation
     const server = new Server(
         {
@@ -301,30 +629,118 @@ async function main() {
     );
 
     // Tool handlers
-    // Filter available tools based on authorized scopes
-    server.setRequestHandler(ListToolsRequestSchema, async () => {
+    // Filter available tools based on the requesting session's authorized scopes
+    server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => {
+        const session = await resolveSession(extra);
+        const scopes = unionScopes(session.accounts);
         const availableTools = toolDefinitions.filter(tool =>
-            hasScope(authorizedScopes, tool.scopes)
+            hasScope(scopes, tool.scopes)
         );
-        return { tools: toMcpTools(availableTools) };
+        // Advertise the `account` selector on every Gmail tool, then append the
+        // account-management meta tools.
+        const gmailTools = toMcpTools(availableTools).map((t: any) => ({
+            ...t,
+            inputSchema: {
+                ...t.inputSchema,
+                properties: { ...(t.inputSchema?.properties || {}), ...ACCOUNT_PARAM },
+            },
+        }));
+        return { tools: [...gmailTools, ...metaToolDefs(session)] };
     });
 
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const { name, arguments: args } = request.params;
+    // Runs a single tool against ONE resolved Gmail client. The CallTool handler
+    // below orchestrates account selection and fan-out, then calls this per account.
+    async function executeTool(
+        name: string,
+        args: any,
+        gmail: ReturnType<typeof google.gmail>,
+        authorizedScopes: string[],
+        sendCtx: SendContext,
+        extra: any,
+    ): Promise<any> {
+        // Gate a send against the per-account policy. If recipients are blocked,
+        // ask the user (elicitation) to allow once, always (save), or cancel.
+        // Returns { allow } when the send may proceed, or { deny } with the result
+        // to return instead.
+        async function gateSend(recipients: Array<string | undefined>): Promise<{ allow: true } | { allow: false; deny: any }> {
+            const blocked = disallowedRecipients(recipients, sendCtx.ownEmail, sendCtx.policy);
+            if (blocked.length === 0) return { allow: true };
 
-        // Verify the tool is authorized for the current scopes
-        // This guards against direct tool calls that bypass ListTools
-        const toolDef = getToolByName(name);
-        if (!toolDef || !hasScope(authorizedScopes, toolDef.scopes)) {
-            return {
-                content: [{
-                    type: "text",
-                    text: `Error: Tool "${name}" is not available. You may need to re-authenticate with additional scopes.`,
-                }],
-            };
+            // Distinct domains among the blocked recipients — surfaced as "allow the
+            // whole domain" options when a pattern emerges. Public providers
+            // (gmail.com, etc.) are excluded: allowing the whole domain there would
+            // mean "send to anyone", so only specific addresses can be allowed.
+            const domains = [...new Set(
+                blocked.map((r) => emailAddressOf(r).split('@')[1]).filter(Boolean),
+            )].filter((d) => !isPublicEmailDomain(d));
+
+            const options: Array<{ value: string; label: string }> = [
+                { value: 'once', label: 'Send this time only' },
+                {
+                    value: 'always',
+                    label: blocked.length === 1
+                        ? `Always allow ${blocked[0]}`
+                        : `Always allow these ${blocked.length} recipients`,
+                },
+            ];
+            if (domains.length === 1) {
+                options.push({ value: 'domain', label: `Always allow anyone @${domains[0]}` });
+            } else if (domains.length > 1) {
+                options.push({ value: 'domains', label: `Always allow all ${domains.length} domains (${domains.join(', ')})` });
+            }
+            options.push({ value: 'cancel', label: "Don't send" });
+
+            const hint = domains.length === 1
+                ? ` (they're all @${domains[0]} — you can allow the whole domain)`
+                : '';
+            const outcome = await elicitChoice(
+                server,
+                extra,
+                `${sendCtx.ownEmail} isn't allowed to send to: ${blocked.join(', ')}.${hint} How should I proceed?`,
+                options,
+            );
+            if (!outcome.supported) return { allow: false, deny: sendBlockedError(blocked) };
+            switch (outcome.choice) {
+                case 'once':
+                    return { allow: true };
+                case 'always':
+                    if (sendCtx.persistAllow) await sendCtx.persistAllow(blocked);
+                    return { allow: true };
+                case 'domain':
+                    if (sendCtx.persistAllow) await sendCtx.persistAllow([domains[0]]);
+                    return { allow: true };
+                case 'domains':
+                    if (sendCtx.persistAllow) await sendCtx.persistAllow(domains);
+                    return { allow: true };
+                default:
+                    return { allow: false, deny: errText(`Send cancelled — not sent to: ${blocked.join(', ')}.`) };
+            }
+        }
+
+        // Confirm a permanent (irreversible) delete via elicitation. Falls back to
+        // a hard block (no delete) if the client can't confirm — the safe default.
+        async function confirmPermanentDelete(count: number): Promise<{ allow: true } | { allow: false; deny: any }> {
+            const msg = count === 1
+                ? 'Permanently delete this message? This CANNOT be undone — it bypasses Trash. (trash_email moves it to Trash instead, recoverable for 30 days.)'
+                : `Permanently delete ${count} message(s)? This CANNOT be undone — it bypasses Trash. (batch_trash_emails moves them to Trash instead, recoverable for 30 days.)`;
+            const c = await elicitConfirm(server, extra, msg);
+            if (!c.supported) {
+                return { allow: false, deny: errText('Permanent delete was not confirmed (this client cannot show a confirmation prompt). Use trash_email / batch_trash_emails instead — those are recoverable.') };
+            }
+            if (c.choice !== 'yes') return { allow: false, deny: errText('Permanent delete cancelled.') };
+            return { allow: true };
         }
 
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
+            // Enforce the per-account send policy before actually sending.
+            if (action === "send") {
+                const gate = await gateSend([
+                    ...(validatedArgs.to || []),
+                    ...(validatedArgs.cc || []),
+                    ...(validatedArgs.bcc || []),
+                ]);
+                if (!gate.allow) return gate.deny;
+            }
             let message: string;
 
             try {
@@ -719,8 +1135,48 @@ async function main() {
                     };
                 }
 
+                case "trash_email": {
+                    const validatedArgs = TrashEmailSchema.parse(args);
+                    await gmail.users.messages.trash({
+                        userId: 'me',
+                        id: validatedArgs.messageId,
+                    });
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: `Email ${validatedArgs.messageId} moved to Trash (recoverable for 30 days).`,
+                            },
+                        ],
+                    };
+                }
+
+                case "batch_trash_emails": {
+                    const validatedArgs = BatchTrashEmailsSchema.parse(args);
+                    const messageIds = validatedArgs.messageIds;
+                    const batchSize = validatedArgs.batchSize || 50;
+                    const { successes, failures } = await processBatches(
+                        messageIds,
+                        batchSize,
+                        async (batch) => Promise.all(
+                            batch.map(async (messageId) => {
+                                await gmail.users.messages.trash({ userId: 'me', id: messageId });
+                                return { messageId, success: true };
+                            })
+                        )
+                    );
+                    let summary = `Batch trash complete.\nMoved to Trash (recoverable): ${successes.length}/${messageIds.length}`;
+                    if (failures.length > 0) {
+                        summary += `\nFailed: ${failures.length}\n` +
+                            failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${f.error.message})`).join('\n');
+                    }
+                    return { content: [{ type: "text", text: summary }] };
+                }
+
                 case "delete_email": {
                     const validatedArgs = DeleteEmailSchema.parse(args);
+                    const gate = await confirmPermanentDelete(1);
+                    if (!gate.allow) return gate.deny;
                     await gmail.users.messages.delete({
                         userId: 'me',
                         id: validatedArgs.messageId,
@@ -730,7 +1186,7 @@ async function main() {
                         content: [
                             {
                                 type: "text",
-                                text: `Email ${validatedArgs.messageId} deleted successfully`,
+                                text: `Email ${validatedArgs.messageId} permanently deleted`,
                             },
                         ],
                     };
@@ -738,6 +1194,20 @@ async function main() {
 
                 case "send_draft": {
                     const validatedArgs = SendDraftSchema.parse(args);
+                    // Enforce the send policy against the draft's actual recipients.
+                    const draft = await gmail.users.drafts.get({
+                        userId: 'me',
+                        id: validatedArgs.draftId,
+                        format: 'metadata',
+                    });
+                    const draftHeaders = draft.data.message?.payload?.headers || [];
+                    const draftRecipients = draftHeaders
+                        .filter((h) => ['to', 'cc', 'bcc'].includes((h.name || '').toLowerCase()))
+                        .flatMap((h) => (h.value || '').split(',').map((s: string) => s.trim()))
+                        .filter((s: string) => s.length > 0);
+                    const gate = await gateSend(draftRecipients);
+                    if (!gate.allow) return gate.deny;
+
                     const response = await gmail.users.drafts.send({
                         userId: 'me',
                         requestBody: { id: validatedArgs.draftId },
@@ -952,6 +1422,9 @@ async function main() {
                     const messageIds = validatedArgs.messageIds;
                     const batchSize = validatedArgs.batchSize || 50;
 
+                    const gate = await confirmPermanentDelete(messageIds.length);
+                    if (!gate.allow) return gate.deny;
+
                     // Process messages in batches
                     const { successes, failures } = await processBatches(
                         messageIds,
@@ -1153,6 +1626,32 @@ async function main() {
                                 text: `Filter details:\nID: ${result.id}\nCriteria: ${criteriaText}\nActions: ${actionText}`,
                             },
                         ],
+                    };
+                }
+
+                case "list_send_as": {
+                    ListSendAsSchema.parse(args);
+                    const sendAsResponse = await gmail.users.settings.sendAs.list({ userId: 'me' });
+                    const aliases = sendAsResponse.data.sendAs || [];
+                    if (aliases.length === 0) {
+                        return { content: [{ type: "text", text: "No send-as addresses configured." }] };
+                    }
+                    const lines = aliases.map((a) => {
+                        const tags = [
+                            a.isPrimary ? 'primary' : null,
+                            a.isDefault ? 'default' : null,
+                            a.verificationStatus && a.verificationStatus !== 'accepted'
+                                ? `verification: ${a.verificationStatus}`
+                                : 'verified',
+                        ].filter(Boolean).join(', ');
+                        const name = a.displayName ? ` "${a.displayName}"` : '';
+                        return `- ${a.sendAsEmail}${name} (${tags})`;
+                    });
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Send-as addresses (use as the "from" parameter):\n${lines.join('\n')}`,
+                        }],
                     };
                 }
 
@@ -1620,6 +2119,7 @@ async function main() {
                         threadId: threadId,
                         inReplyTo: originalMessageId,
                         attachments: validatedArgs.attachments,
+                        from: validatedArgs.from, // send as a configured send-as alias
                     };
 
                     // Use the existing handleEmailAction to send the reply
@@ -1670,6 +2170,17 @@ async function main() {
                     throw new Error(`Unknown tool: ${name}`);
             }
         } catch (error: any) {
+            // A dead Google grant (revoked by the user, or expired — refresh tokens
+            // only last 7 days while the OAuth app is External+Testing) surfaces as
+            // invalid_grant. Clear the stale client/grant and tell the user to
+            // reconnect, instead of failing opaquely forever.
+            if (isInvalidGrantError(error)) {
+                try { await sendCtx.onInvalidGrant?.(); } catch { /* best effort */ }
+                return errText(
+                    `Error: Google access for ${sendCtx.ownEmail} has expired or been revoked (invalid_grant). ` +
+                    `Reconnect the connector to re-authorize this mailbox.`,
+                );
+            }
             return {
                 content: [
                     {
@@ -1679,10 +2190,104 @@ async function main() {
                 ],
             };
         }
+    }
+
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+        const { name, arguments: rawArgs } = request.params;
+        const args: any = rawArgs || {};
+
+        let session: PrincipalSession;
+        try {
+            session = await resolveSession(extra);
+        } catch (error: any) {
+            return errText(`Error: ${error.message}`);
+        }
+
+        // Account-management meta tools (no per-account Gmail client needed).
+        if (name === 'list_accounts') return metaListAccounts(session);
+        if (name === 'link_account') return metaLinkAccount(session);
+        if (name === 'unlink_account') return metaUnlinkAccount(session, args);
+        // Send-policy management (confirmed via elicitation).
+        if (name === 'get_send_policy') return metaGetSendPolicy(session, args);
+        if (name === 'allow_send_recipient') return metaAllowSender(session, server, extra, args);
+        if (name === 'disallow_send_recipient') return metaDisallowSender(session, server, extra, args);
+        if (name === 'set_dangerous_send') return metaSetDangerous(session, server, extra, args);
+
+        // Availability gating against the union of scopes across linked accounts.
+        const toolDef = getToolByName(name);
+        if (!toolDef || !hasScope(unionScopes(session.accounts), toolDef.scopes)) {
+            return errText(`Error: Tool "${name}" is not available. You may need to re-authenticate with additional scopes.`);
+        }
+
+        const sendCtx = (a: Account): SendContext => ({
+            ownEmail: a.email,
+            policy: a.sendPolicy,
+            persistAllow: session.setSendPolicy
+                ? async (entries: string[]) => {
+                    const cur = a.sendPolicy || { allowlist: [], dangerouslyAllowAll: false };
+                    const merged = Array.from(
+                        new Set([...cur.allowlist, ...entries.map(emailAddressOf)]),
+                    );
+                    await session.setSendPolicy!(a.sub, {
+                        allowlist: merged,
+                        dangerouslyAllowAll: cur.dangerouslyAllowAll,
+                    });
+                }
+                : undefined,
+            onInvalidGrant: session.handleInvalidGrant
+                ? () => session.handleInvalidGrant!(a.sub)
+                : undefined,
+        });
+
+        const accounts = session.accounts;
+        const multi = accounts.length > 1;
+        const selector: string | undefined = args.account;
+        const toolArgs = stripAccount(args);
+
+        if (WRITE_TOOLS.has(name)) {
+            // Writes need an explicit account whenever the choice is ambiguous.
+            let target: Account | undefined;
+            if (selector) target = findAccount(session, selector);
+            else if (accounts.length === 1) target = accounts[0];
+            if (!target) {
+                return errText(
+                    `Error: "${name}" changes a mailbox, so it needs an explicit account. ` +
+                    `Set "account" to one of: ${accounts.map(a => a.email).join(', ')}`,
+                );
+            }
+            const { gmail, authorizedScopes } = session.getClient(target.sub);
+            const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(target), extra);
+            return multi ? annotate(target.email, target.primary, result) : result;
+        }
+
+        // Reads: a specific account if named, otherwise fan out across all linked.
+        let targets: Account[];
+        if (selector) {
+            const a = findAccount(session, selector);
+            if (!a) {
+                return errText(`Error: account "${selector}" is not linked. Linked: ${accounts.map(x => x.email).join(', ')}`);
+            }
+            targets = [a];
+        } else {
+            targets = accounts;
+        }
+
+        if (!multi) {
+            const { gmail, authorizedScopes } = session.getClient(targets[0].sub);
+            return executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(targets[0]), extra);
+        }
+
+        const content: any[] = [];
+        for (const acct of targets) {
+            const { gmail, authorizedScopes } = session.getClient(acct.sub);
+            const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(acct), extra);
+            content.push({ type: 'text', text: `=== ${acct.email}${acct.primary ? ' (primary)' : ''} ===` });
+            for (const c of result?.content || []) content.push(c);
+        }
+        return { content };
     });
 
-    const transport = new StdioServerTransport();
-    server.connect(transport);
+    return server;
 }
 
 main().catch((error) => {
