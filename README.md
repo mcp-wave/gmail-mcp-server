@@ -267,6 +267,9 @@ Remote mode requires a **public HTTPS URL** (claude.ai only connects to HTTPS is
 | `GMAIL_MCP_SCOPES` | | Comma-separated Gmail scopes to request (default `gmail.modify,gmail.settings.basic`). See [OAuth Scopes](#oauth-scopes). |
 | `MCP_ALLOWED_ORIGINS` | | Extra comma-separated `Origin` values allowed to call `/mcp` (for browser-based MCP clients). |
 | `GMAIL_OAUTH_PATH` | | Path to `gcp-oauth.keys.json` if not in `~/.gmail-mcp/`. |
+| `STORE_BACKEND` | | `file` or `firestore`. Defaults to `firestore` on Cloud Run (`K_SERVICE` is set), `file` everywhere else. |
+| `FIRESTORE_DATABASE_ID` | | Firestore database id (default `(default)`). Firestore backend only. |
+| `GOOGLE_CLOUD_PROJECT` | | GCP project for Firestore. Auto-detected on Cloud Run; `GCP_PROJECT` also works. |
 
 ```bash
 npm run build
@@ -287,7 +290,19 @@ https://YOUR_DOMAIN/mcp
 
 claude.ai walks the OAuth flow automatically: you'll be sent to Google to sign in and grant access, then dropped back into claude.ai with Gmail connected. Each person who adds the connector authenticates their own mailbox.
 
-> **Security note.** Remote mode is a real multi-tenant service. Run it behind HTTPS, keep `TOKEN_ENCRYPTION_KEY` secret and stable, and treat `~/.gmail-mcp/oauth-store.json` as sensitive (it holds encrypted grants). Token/grant storage is single-process and file-backed; running multiple instances behind a load balancer is not yet supported. If a user revokes access in their Google account, they reconnect the connector to refresh the grant.
+### Stateless transport
+
+The MCP endpoint is **stateless** (MCP 2025-11-25 Streamable HTTP). Sessions are optional in the spec and this server does not use them:
+
+- No `Mcp-Session-Id` is issued at initialization, so clients never have to send one back.
+- Every POST stands on its own: it carries its own bearer token, resolves its own principal, and is torn down when the response closes. Nothing about a connection is held in memory between requests.
+- `GET /mcp` (the optional standalone notification stream) and `DELETE /mcp` (session teardown) both answer `405`. There are no unsolicited notifications to stream and no session to delete.
+
+In practice that means a redeploy or a restart does not strand connected clients on a session id that no longer exists, and any instance can serve any request.
+
+**Scaling out.** With `STORE_BACKEND=firestore`, grants and tokens are shared, so multiple instances work. One caveat: when the server asks the user a question mid-call (the send-policy prompt, the permanent-delete confirmation), the answer arrives as a separate HTTP request and has to reach the instance that asked. Turn on session affinity at the load balancer (`gcloud run deploy --session-affinity` on Cloud Run) so it does. Without affinity, everything else still works and those prompts fail closed: the send is blocked rather than silently allowed.
+
+> **Security note.** Remote mode is a real multi-tenant service. Run it behind HTTPS, keep `TOKEN_ENCRYPTION_KEY` secret and stable, and treat `~/.gmail-mcp/oauth-store.json` as sensitive (it holds encrypted grants). The file-backed store is single-process; use the Firestore backend to run more than one instance. If a user revokes access in their Google account, they reconnect the connector to refresh the grant.
 
 ## OAuth Scopes
 

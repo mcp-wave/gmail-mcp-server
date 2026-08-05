@@ -5,17 +5,15 @@
 //   - mcpAuthRouter: serves discovery metadata (.well-known/*), dynamic client
 //     registration, /authorize, /token, /revoke — backed by GmailOAuthProvider.
 //   - /oauth2/google/callback: the upstream (Google) redirect target.
-//   - /mcp: bearer-authenticated MCP endpoint. Each request resolves the caller's
-//     own Gmail client from its token, so the server is multi-tenant.
+//   - /mcp: bearer-authenticated, stateless MCP endpoint (see mcp-endpoint.ts).
+//     Each request resolves the caller's own Gmail client from its token, so the
+//     server is multi-tenant and holds no per-connection state between requests.
 
 import express from 'express';
 import type { Request, Response } from 'express';
-import { randomUUID } from 'crypto';
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { createStatelessMcpEndpoint, type McpServerFactory } from './mcp-endpoint.js';
 import { loadHttpConfig, type HttpConfig } from './config.js';
 import { createStore } from './store.js';
 import { GmailOAuthProvider } from './provider.js';
@@ -24,18 +22,24 @@ import type { OAuthStore } from './store.js';
 import { rejectedAllowlistEntry } from '../send-policy.js';
 import type { PrincipalSession, Account, ResolveSession, SendPolicy } from '../session.js';
 
-/** What each tool call needs: a Gmail client + the caller's granted scopes. */
-/** Builds the MCP Server with all tool handlers (implemented in index.ts). */
-export type McpServerFactory = (resolve: ResolveSession) => Server;
+export type { McpServerFactory };
 
-/** Reject browser requests from disallowed origins (DNS-rebinding protection). */
+/**
+ * Reject browser requests from disallowed origins (DNS-rebinding protection).
+ * The spec requires 403 for a present-but-invalid Origin, and allows the body to
+ * be a JSON-RPC error response with no id.
+ */
 function originGuard(config: HttpConfig) {
     const allowed = new Set([config.baseUrl, ...config.allowedOrigins]);
     return (req: Request, res: Response, next: express.NextFunction) => {
         const origin = req.headers.origin;
         // Server-to-server callers (e.g. claude.ai's backend) send no Origin.
         if (!origin || allowed.has(origin)) return next();
-        res.status(403).json({ error: 'forbidden_origin' });
+        res.status(403).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Forbidden origin' },
+            id: null,
+        });
     };
 }
 
@@ -256,60 +260,13 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
     const bearer = requireBearerAuth({ verifier: provider, resourceMetadataUrl });
     const origin = originGuard(config);
 
-    // Stateful Streamable HTTP: one transport per MCP session, keyed by session id.
-    const transports: Record<string, StreamableHTTPServerTransport> = {};
-
-    app.post('/mcp', origin, bearer, express.json(), async (req: Request, res: Response) => {
-        try {
-            const sessionId = req.headers['mcp-session-id'] as string | undefined;
-            let transport = sessionId ? transports[sessionId] : undefined;
-
-            if (!transport && isInitializeRequest(req.body)) {
-                transport = new StreamableHTTPServerTransport({
-                    sessionIdGenerator: () => randomUUID(),
-                    onsessioninitialized: (sid) => {
-                        transports[sid] = transport!;
-                    },
-                });
-                transport.onclose = () => {
-                    if (transport!.sessionId) delete transports[transport!.sessionId];
-                };
-                const server = createMcpServer(resolveSession);
-                await server.connect(transport);
-            } else if (!transport) {
-                res.status(400).json({
-                    jsonrpc: '2.0',
-                    error: { code: -32000, message: 'No valid session; send an initialize request first.' },
-                    id: null,
-                });
-                return;
-            }
-
-            await transport.handleRequest(req, res, req.body);
-        } catch (err: any) {
-            console.error('MCP request error:', err?.message || err);
-            if (!res.headersSent) {
-                res.status(500).json({
-                    jsonrpc: '2.0',
-                    error: { code: -32603, message: 'Internal server error' },
-                    id: null,
-                });
-            }
-        }
-    });
-
-    // GET (server->client SSE stream) and DELETE (session teardown).
-    const sessionRequest = async (req: Request, res: Response) => {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
-        const transport = sessionId ? transports[sessionId] : undefined;
-        if (!transport) {
-            res.status(400).send('Invalid or missing session id');
-            return;
-        }
-        await transport.handleRequest(req, res);
-    };
-    app.get('/mcp', origin, bearer, sessionRequest);
-    app.delete('/mcp', origin, bearer, sessionRequest);
+    // Stateless Streamable HTTP: no session id, a fresh transport and MCP Server
+    // per request, nothing held between requests.
+    const mcp = createStatelessMcpEndpoint(createMcpServer, resolveSession);
+    app.post('/mcp', origin, bearer, express.json(), mcp.post);
+    // No standalone notification stream and no session to delete.
+    app.get('/mcp', origin, bearer, mcp.methodNotAllowed);
+    app.delete('/mcp', origin, bearer, mcp.methodNotAllowed);
 
     app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));
 
