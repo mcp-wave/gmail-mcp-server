@@ -53,9 +53,6 @@ export interface ClientRequestRelay {
 
     /** Drop announcements left behind by instances that went away. */
     sweep(): Promise<void>;
-
-    /** Release any backend resources (tests). */
-    close?(): Promise<void>;
 }
 
 /** Single-process relay: the wait and the answer are already in the same heap. */
