@@ -4,6 +4,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
     CallToolRequestSchema,
+    ElicitResultSchema,
     ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { google } from 'googleapis';
@@ -209,7 +210,7 @@ async function metaGetSendPolicy(session: PrincipalSession, args: any) {
     return errText(`Send policy (sending to an account's own address is always allowed):\n${lines.join('\n')}`);
 }
 
-async function metaAllowSender(session: PrincipalSession, server: Server, args: any) {
+async function metaAllowSender(session: PrincipalSession, server: Server, extra: any, args: any) {
     if (!session.setSendPolicy) return errText('Send settings are only available on the hosted server.');
     const acct = settingsAccount(session, args);
     if ('error' in acct) return errText(`Error: ${acct.error}`);
@@ -217,7 +218,7 @@ async function metaAllowSender(session: PrincipalSession, server: Server, args: 
     if (!entry) return errText('Provide a recipient email address or domain to allow.');
     const rejected = rejectedAllowlistEntry(entry);
     if (rejected) return errText(`Error: ${rejected}`);
-    const confirm = await elicitConfirm(server, `Always allow ${acct.email} to send to "${entry}"?`);
+    const confirm = await elicitConfirm(server, extra, `Always allow ${acct.email} to send to "${entry}"?`);
     if (confirm.supported && confirm.choice !== 'yes') return errText('No change made.');
     const cur = acct.sendPolicy || { allowlist: [], dangerouslyAllowAll: false };
     const merged = Array.from(new Set([...cur.allowlist, entry]));
@@ -225,13 +226,13 @@ async function metaAllowSender(session: PrincipalSession, server: Server, args: 
     return errText(`Allowed "${entry}" for ${acct.email}. Now: ${describePolicy({ allowlist: merged, dangerouslyAllowAll: cur.dangerouslyAllowAll })}.`);
 }
 
-async function metaDisallowSender(session: PrincipalSession, server: Server, args: any) {
+async function metaDisallowSender(session: PrincipalSession, server: Server, extra: any, args: any) {
     if (!session.setSendPolicy) return errText('Send settings are only available on the hosted server.');
     const acct = settingsAccount(session, args);
     if ('error' in acct) return errText(`Error: ${acct.error}`);
     const entry = String(args?.recipient || '').trim().toLowerCase();
     if (!entry) return errText('Provide a recipient email address or domain to remove.');
-    const confirm = await elicitConfirm(server, `Stop allowing ${acct.email} to send to "${entry}"?`);
+    const confirm = await elicitConfirm(server, extra, `Stop allowing ${acct.email} to send to "${entry}"?`);
     if (confirm.supported && confirm.choice !== 'yes') return errText('No change made.');
     const cur = acct.sendPolicy || { allowlist: [], dangerouslyAllowAll: false };
     const filtered = cur.allowlist.filter(e => e !== entry);
@@ -239,13 +240,14 @@ async function metaDisallowSender(session: PrincipalSession, server: Server, arg
     return errText(`Removed "${entry}" from ${acct.email}. Now: ${describePolicy({ allowlist: filtered, dangerouslyAllowAll: cur.dangerouslyAllowAll })}.`);
 }
 
-async function metaSetDangerous(session: PrincipalSession, server: Server, args: any) {
+async function metaSetDangerous(session: PrincipalSession, server: Server, extra: any, args: any) {
     if (!session.setSendPolicy) return errText('Send settings are only available on the hosted server.');
     const acct = settingsAccount(session, args);
     if ('error' in acct) return errText(`Error: ${acct.error}`);
     const enabled = args?.enabled === true || args?.enabled === 'true' || args?.enabled === 'on';
     const confirm = await elicitConfirm(
         server,
+        extra,
         enabled
             ? `⚠️ Allow ${acct.email} to send email to ANYONE, with no recipient checks? This removes the send safety gate.`
             : `Turn OFF "send to anyone" for ${acct.email} and restore the allowlist gate?`,
@@ -258,8 +260,18 @@ async function metaSetDangerous(session: PrincipalSession, server: Server, args:
 
 // --- Elicitation helpers ---------------------------------------------------
 // MCP elicitation lets the SERVER ask the user a question mid-tool-call (via the
-// client). elicitInput throws synchronously if the client hasn't advertised the
-// elicitation capability, so we can fall back instantly with no hang.
+// client). Two details matter for the remote (stateless HTTP) transport:
+//
+//   - The question goes out through `extra.sendRequest`, which tags it as
+//     related to the tool call that raised it, so it travels on that call's own
+//     response stream. A bare server.request() is unrelated traffic and needs
+//     the standalone GET stream, which a stateless endpoint does not offer.
+//   - It does not go through server.elicitInput(), which refuses to send unless
+//     it saw the client advertise the capability during initialize. Over
+//     stateless HTTP that handshake happened on an earlier, separate request, so
+//     this instance has no record of it and every gate would fail closed. Asking
+//     anyway is safe: a client without elicitation answers with a JSON-RPC
+//     error, which lands in the catch below.
 
 const ELICIT_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -268,31 +280,46 @@ type ElicitOutcome = { supported: true; choice: string | null } | { supported: f
 /** Ask the user to pick one of `options` (value/label). Returns the chosen value. */
 async function elicitChoice(
     server: Server,
+    extra: any,
     message: string,
     options: Array<{ value: string; label: string }>,
 ): Promise<ElicitOutcome> {
+    // Known capabilities (stdio, where initialize ran against this instance) let
+    // us skip a doomed round trip. Unknown means stateless HTTP: just ask.
+    const clientCapabilities = server.getClientCapabilities();
+    if (clientCapabilities && !clientCapabilities.elicitation) return { supported: false };
+    if (typeof extra?.sendRequest !== 'function') return { supported: false };
+
     try {
-        const res = await server.elicitInput(
+        const res = await extra.sendRequest(
             {
-                message,
-                requestedSchema: {
-                    type: 'object',
-                    properties: {
-                        choice: {
-                            type: 'string',
-                            description: 'How to proceed.',
-                            enum: options.map((o) => o.value),
-                            enumNames: options.map((o) => o.label),
+                method: 'elicitation/create',
+                params: {
+                    mode: 'form',
+                    message,
+                    requestedSchema: {
+                        type: 'object',
+                        properties: {
+                            choice: {
+                                type: 'string',
+                                description: 'How to proceed.',
+                                enum: options.map((o) => o.value),
+                                enumNames: options.map((o) => o.label),
+                            },
                         },
+                        required: ['choice'],
                     },
-                    required: ['choice'],
                 },
-            } as any,
+            },
+            ElicitResultSchema,
             { timeout: ELICIT_TIMEOUT_MS },
         );
         if (res.action !== 'accept') return { supported: true, choice: null };
+        // Validate here rather than trusting the client: we are the ones acting
+        // on the answer, and anything outside the offered set means "no".
         const c = (res.content as any)?.choice;
-        return { supported: true, choice: typeof c === 'string' ? c : null };
+        const chosen = options.some((o) => o.value === c) ? (c as string) : null;
+        return { supported: true, choice: chosen };
     } catch {
         // Client doesn't support elicitation (or it failed) — caller decides fallback.
         return { supported: false };
@@ -300,8 +327,8 @@ async function elicitChoice(
 }
 
 /** Yes/no confirmation. Returns true only on an explicit "yes". */
-async function elicitConfirm(server: Server, message: string): Promise<ElicitOutcome> {
-    return elicitChoice(server, message, [
+async function elicitConfirm(server: Server, extra: any, message: string): Promise<ElicitOutcome> {
+    return elicitChoice(server, extra, message, [
         { value: 'yes', label: 'Yes, proceed' },
         { value: 'no', label: 'No, cancel' },
     ]);
@@ -629,6 +656,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
         gmail: ReturnType<typeof google.gmail>,
         authorizedScopes: string[],
         sendCtx: SendContext,
+        extra: any,
     ): Promise<any> {
         // Gate a send against the per-account policy. If recipients are blocked,
         // ask the user (elicitation) to allow once, always (save), or cancel.
@@ -667,6 +695,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                 : '';
             const outcome = await elicitChoice(
                 server,
+                extra,
                 `${sendCtx.ownEmail} isn't allowed to send to: ${blocked.join(', ')}.${hint} How should I proceed?`,
                 options,
             );
@@ -694,7 +723,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
             const msg = count === 1
                 ? 'Permanently delete this message? This CANNOT be undone — it bypasses Trash. (trash_email moves it to Trash instead, recoverable for 30 days.)'
                 : `Permanently delete ${count} message(s)? This CANNOT be undone — it bypasses Trash. (batch_trash_emails moves them to Trash instead, recoverable for 30 days.)`;
-            const c = await elicitConfirm(server, msg);
+            const c = await elicitConfirm(server, extra, msg);
             if (!c.supported) {
                 return { allow: false, deny: errText('Permanent delete was not confirmed (this client cannot show a confirmation prompt). Use trash_email / batch_trash_emails instead — those are recoverable.') };
             }
@@ -2180,9 +2209,9 @@ function createMcpServer(resolveSession: ResolveSession): Server {
         if (name === 'unlink_account') return metaUnlinkAccount(session, args);
         // Send-policy management (confirmed via elicitation).
         if (name === 'get_send_policy') return metaGetSendPolicy(session, args);
-        if (name === 'allow_send_recipient') return metaAllowSender(session, server, args);
-        if (name === 'disallow_send_recipient') return metaDisallowSender(session, server, args);
-        if (name === 'set_dangerous_send') return metaSetDangerous(session, server, args);
+        if (name === 'allow_send_recipient') return metaAllowSender(session, server, extra, args);
+        if (name === 'disallow_send_recipient') return metaDisallowSender(session, server, extra, args);
+        if (name === 'set_dangerous_send') return metaSetDangerous(session, server, extra, args);
 
         // Availability gating against the union of scopes across linked accounts.
         const toolDef = getToolByName(name);
@@ -2227,7 +2256,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                 );
             }
             const { gmail, authorizedScopes } = session.getClient(target.sub);
-            const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(target));
+            const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(target), extra);
             return multi ? annotate(target.email, target.primary, result) : result;
         }
 
@@ -2245,13 +2274,13 @@ function createMcpServer(resolveSession: ResolveSession): Server {
 
         if (!multi) {
             const { gmail, authorizedScopes } = session.getClient(targets[0].sub);
-            return executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(targets[0]));
+            return executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(targets[0]), extra);
         }
 
         const content: any[] = [];
         for (const acct of targets) {
             const { gmail, authorizedScopes } = session.getClient(acct.sub);
-            const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(acct));
+            const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(acct), extra);
             content.push({ type: 'text', text: `=== ${acct.email}${acct.primary ? ' (primary)' : ''} ===` });
             for (const c of result?.content || []) content.push(c);
         }
