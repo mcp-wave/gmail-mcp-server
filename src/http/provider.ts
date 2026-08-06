@@ -77,30 +77,31 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         res.redirect(`${this.config.baseUrl}/manage?req=${encodeURIComponent(reqId)}`);
     }
 
-    /** Mint a browser session for a principal; returns the raw session id (cookie value). */
-    async createSession(principalId: string): Promise<string> {
-        const sessionId = generateToken();
-        await this.store.putSession(sessionId, { principalId, createdAtSec: nowSec() });
-        return sessionId;
-    }
-
-    /** Find-or-create the principal owning a freshly-authorized Google account. */
+    /**
+     * Resolve the principal for whoever just signed in with Google at connect time.
+     *
+     * A sign-in proves control of exactly one mailbox, so it may only resume the
+     * principal that this account ESTABLISHED (is the primary of). Being linked
+     * into someone's principal as a secondary must never resume that principal —
+     * otherwise any shared or team mailbox becomes a master key to every sibling
+     * mailbox on it, from any client that signs in with it. A secondary (or new)
+     * account gets its own principal owning only itself.
+     */
     async ensurePrincipal(identity: GoogleIdentity): Promise<string> {
         await this.store.upsertGoogleUser(
             identity.sub, identity.email, identity.refreshToken, identity.scopeNames,
         );
-        const existing = await this.store.getGoogleUser(identity.sub);
-        let principalId = existing?.principalId;
-        if (!principalId) {
-            principalId = generateToken();
-            await this.store.createPrincipal({
-                id: principalId,
-                primarySub: identity.sub,
-                accountSubs: [identity.sub],
-                createdAt: nowSec(),
-            });
-            await this.store.setUserPrincipal(identity.sub, principalId);
-        }
+        const owned = await this.store.getPrimaryPrincipal(identity.sub);
+        if (owned && (await this.store.getPrincipal(owned))) return owned;
+
+        const principalId = generateToken();
+        await this.store.createPrincipal({
+            id: principalId,
+            primarySub: identity.sub,
+            accountSubs: [identity.sub],
+            createdAt: nowSec(),
+        });
+        await this.store.setPrimaryPrincipal(identity.sub, principalId);
         return principalId;
     }
 
@@ -142,7 +143,12 @@ export class GmailOAuthProvider implements OAuthServerProvider {
         return { redirectUri: ar.redirectUri, code, state: ar.state };
     }
 
-    /** Attach a newly-authorized Google account to an existing principal. */
+    /**
+     * Attach a newly-authorized Google account to an existing principal.
+     * Membership is recorded on the principal only: linking never claims the
+     * account, so it stays resumable solely by its own primary principal (if any)
+     * and can be linked into other principals independently.
+     */
     async linkGoogleAccount(principalId: string, identity: GoogleIdentity): Promise<void> {
         await this.store.upsertGoogleUser(
             identity.sub,
@@ -150,7 +156,6 @@ export class GmailOAuthProvider implements OAuthServerProvider {
             identity.refreshToken,
             identity.scopeNames,
         );
-        await this.store.setUserPrincipal(identity.sub, principalId);
         await this.store.addAccountToPrincipal(principalId, identity.sub);
     }
 

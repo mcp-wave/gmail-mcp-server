@@ -206,8 +206,7 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
         }
         const principal = await store.getPrincipal(principalId);
         if (principal && sub !== principal.primarySub && principal.accountSubs.includes(sub)) {
-            await store.removeAccountFromPrincipal(principalId, sub);
-            await store.deleteGoogleUser(sub);
+            await store.unlinkAccount(principalId, sub);
             cache.evict(sub);
         }
         res.redirect(`/manage?req=${encodeURIComponent(reqId)}`);
@@ -231,7 +230,7 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
                 // Drop forbidden domain-level entries (public email providers).
                 .filter((s) => !rejectedAllowlistEntry(s));
             const dangerouslyAllowAll = req.body?.dangerous === 'on' || req.body?.dangerous === 'true';
-            await store.setSendPolicy(sub, { allowlist, dangerouslyAllowAll });
+            await store.setSendPolicy(principalId, sub, { allowlist, dangerouslyAllowAll });
             cache.evict(sub); // pick up the new policy on next use
         }
         res.redirect(`/manage?req=${encodeURIComponent(reqId)}`);
@@ -321,7 +320,7 @@ async function listPrincipalAccounts(
             sub,
             email: user?.email || sub,
             primary: sub === principal.primarySub,
-            sendPolicy: user?.sendPolicy,
+            sendPolicy: await store.getSendPolicy(principalId, sub),
         });
     }
     return out;
@@ -399,7 +398,7 @@ async function buildPrincipalSession(
                 email: user.email,
                 primary: isPrimary,
                 scopeNames,
-                sendPolicy: user.sendPolicy,
+                sendPolicy: await store.getSendPolicy(principalId, sub),
             });
         } catch (err) {
             // Secondary with a dead grant: skip it. Dead primary: fail the session.
@@ -421,12 +420,11 @@ async function buildPrincipalSession(
             return `${config.baseUrl}/link/start?ticket=${encodeURIComponent(ticket)}`;
         },
         unlinkAccount: async (sub: string) => {
-            await store.removeAccountFromPrincipal(principalId, sub);
-            await store.deleteGoogleUser(sub);
+            await store.unlinkAccount(principalId, sub);
             cache.evict(sub);
         },
         setSendPolicy: async (sub: string, policy: SendPolicy) => {
-            await store.setSendPolicy(sub, policy);
+            await store.setSendPolicy(principalId, sub, policy);
             cache.evict(sub); // rebuild with the new policy next request
         },
         handleInvalidGrant: async (sub: string) => {

@@ -60,8 +60,6 @@ export interface HttpConfig {
     pendingAuthTtlSec: number;
     /** Lifetime of a parked authorize request (while managing accounts), in seconds. */
     authRequestTtlSec: number;
-    /** Lifetime of a browser session cookie, in seconds. */
-    sessionTtlSec: number;
 }
 
 // The single MCP-level scope. We deliberately do NOT expose Google scope URLs
@@ -201,7 +199,6 @@ export function loadHttpConfig(): HttpConfig {
         authCodeTtlSec: 60, // 1 minute
         pendingAuthTtlSec: 10 * 60, // 10 minutes
         authRequestTtlSec: 30 * 60, // 30 minutes (manage page may stay open)
-        sessionTtlSec: 60 * 60 * 24 * 30, // 30 days
     };
 }
 
