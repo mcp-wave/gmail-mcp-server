@@ -15,7 +15,7 @@ import {
     type GoogleUserRecord,
     type PrincipalRecord,
     type LinkTicketRecord,
-    type SessionRecord,
+    type PrincipalAccountRecord,
     type AuthRequestRecord,
     type AccessTokenRecord,
     type RefreshTokenRecord,
@@ -28,8 +28,6 @@ import {
     nowSec,
 } from './store.js';
 
-const SESSION_MAX_AGE_SEC = 60 * 60 * 24 * 30; // 30 days
-
 const C = {
     clients: 'oauth_clients',
     pendingAuths: 'oauth_pending_auths',
@@ -38,13 +36,19 @@ const C = {
     refreshTokens: 'oauth_refresh_tokens',
     googleUsers: 'oauth_google_users',
     principals: 'oauth_principals',
+    principalAccounts: 'oauth_principal_accounts',
+    primaryOwners: 'oauth_primary_owners',
     linkTickets: 'oauth_link_tickets',
-    sessions: 'oauth_sessions',
     authRequests: 'oauth_auth_requests',
 } as const;
 
 function ttl(sec: number): Timestamp {
     return Timestamp.fromMillis((nowSec() + sec) * 1000);
+}
+
+/** Firestore doc ids may not contain '/', so join with a safe separator. */
+function accountDocId(principalId: string, sub: string): string {
+    return `${principalId}__${sub}`;
 }
 
 export class FirestoreOAuthStore implements OAuthStore {
@@ -230,18 +234,39 @@ export class FirestoreOAuthStore implements OAuthStore {
         await this.db.collection(C.googleUsers).doc(sub).delete();
     }
 
-    async setUserPrincipal(sub: string, principalId: string): Promise<void> {
-        await this.db
-            .collection(C.googleUsers)
-            .doc(sub)
-            .set({ principalId }, { merge: true });
+    async getPrimaryPrincipal(sub: string): Promise<string | undefined> {
+        const snap = await this.db.collection(C.primaryOwners).doc(sub).get();
+        if (snap.exists) return (snap.data() as { principalId: string }).principalId;
+        // Migrate a pre-index record forward, but ONLY when the legacy
+        // back-reference names a principal this sub actually established. A sub
+        // that was merely linked as a secondary gets nothing.
+        const legacy = (await this.getGoogleUser(sub))?.principalId;
+        if (!legacy) return undefined;
+        if ((await this.getPrincipal(legacy))?.primarySub !== sub) return undefined;
+        await this.setPrimaryPrincipal(sub, legacy);
+        return legacy;
     }
 
-    async setSendPolicy(sub: string, policy: SendPolicy): Promise<void> {
+    async setPrimaryPrincipal(sub: string, principalId: string): Promise<void> {
+        await this.db.collection(C.primaryOwners).doc(sub).set({ principalId });
+    }
+
+    async getSendPolicy(principalId: string, sub: string): Promise<SendPolicy | undefined> {
+        const snap = await this.db
+            .collection(C.principalAccounts)
+            .doc(accountDocId(principalId, sub))
+            .get();
+        if (snap.exists) return (snap.data() as PrincipalAccountRecord).sendPolicy;
+        // Un-migrated: fall back to the legacy per-sub policy so an existing
+        // user's allowlist is not silently dropped on upgrade.
+        return (await this.getGoogleUser(sub))?.sendPolicy;
+    }
+
+    async setSendPolicy(principalId: string, sub: string, policy: SendPolicy): Promise<void> {
         await this.db
-            .collection(C.googleUsers)
-            .doc(sub)
-            .set({ sendPolicy: policy }, { merge: true });
+            .collection(C.principalAccounts)
+            .doc(accountDocId(principalId, sub))
+            .set({ principalId, sub, sendPolicy: policy });
     }
 
     // ---- principals -------------------------------------------------------
@@ -267,14 +292,31 @@ export class FirestoreOAuthStore implements OAuthStore {
         });
     }
 
-    async removeAccountFromPrincipal(principalId: string, sub: string): Promise<void> {
+    async unlinkAccount(principalId: string, sub: string): Promise<void> {
         const ref = this.db.collection(C.principals).doc(principalId);
-        await this.db.runTransaction(async (tx) => {
+        const removed = await this.db.runTransaction(async (tx) => {
             const snap = await tx.get(ref);
-            if (!snap.exists) return;
+            if (!snap.exists) return false;
             const p = snap.data() as PrincipalRecord;
+            if (sub === p.primarySub) return false; // the primary is never unlinkable
             tx.update(ref, { accountSubs: p.accountSubs.filter((s) => s !== sub) });
+            return true;
         });
+        if (!removed) return;
+        await this.db
+            .collection(C.principalAccounts)
+            .doc(accountDocId(principalId, sub))
+            .delete();
+        // Keep the shared Google grant alive while any other principal links it.
+        const others = await this.db
+            .collection(C.principals)
+            .where('accountSubs', 'array-contains', sub)
+            .limit(1)
+            .get();
+        if (others.empty) {
+            await this.deleteGoogleUser(sub);
+            await this.db.collection(C.primaryOwners).doc(sub).delete();
+        }
     }
 
     // ---- link tickets (one-time) ------------------------------------------
@@ -299,27 +341,6 @@ export class FirestoreOAuthStore implements OAuthStore {
             if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
             return stripMeta(rec) as LinkTicketRecord;
         });
-    }
-
-    // ---- browser sessions -------------------------------------------------
-
-    async putSession(sessionId: string, record: SessionRecord): Promise<void> {
-        await this.db
-            .collection(C.sessions)
-            .doc(hashToken(sessionId))
-            .set({ ...record, expireAt: ttl(SESSION_MAX_AGE_SEC) });
-    }
-
-    async getSession(sessionId: string, ttlSec: number): Promise<SessionRecord | undefined> {
-        const snap = await this.db.collection(C.sessions).doc(hashToken(sessionId)).get();
-        if (!snap.exists) return undefined;
-        const rec = snap.data() as DocumentData;
-        if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
-        return stripMeta(rec) as SessionRecord;
-    }
-
-    async deleteSession(sessionId: string): Promise<void> {
-        await this.db.collection(C.sessions).doc(hashToken(sessionId)).delete();
     }
 
     // ---- parked authorize requests (manage flow) --------------------------

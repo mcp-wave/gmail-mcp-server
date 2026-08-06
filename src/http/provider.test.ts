@@ -66,13 +66,26 @@ async function connect(
     return { principalId, ...fin };
 }
 
+/** Park an authorize request and return its reqId. */
+async function park(provider: GmailOAuthProvider): Promise<string> {
+    let captured = '';
+    const res = { redirect: (u: string) => { captured = u; } } as any;
+    await provider.authorize(CLIENT, {
+        state: 's', scopes: ['gmail'], redirectUri: CLIENT.redirect_uris[0],
+        codeChallenge: CHALLENGE, resource: new URL(RESOURCE),
+    }, res);
+    return new URL(captured).searchParams.get('req')!;
+}
+
 describe('GmailOAuthProvider full flow', () => {
     let dir: string;
     let store: FileOAuthStore;
     let provider: GmailOAuthProvider;
+    let encryptionKey: Buffer;
     beforeEach(() => {
         dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gmail-mcp-prov-'));
-        store = new FileOAuthStore(dir, crypto.randomBytes(32));
+        encryptionKey = crypto.randomBytes(32);
+        store = new FileOAuthStore(dir, encryptionKey);
         provider = new GmailOAuthProvider(makeConfig(dir), store);
     });
     afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -189,20 +202,20 @@ describe('GmailOAuthProvider full flow', () => {
         expect(principal?.primarySub).toBe('google-sub-1');
         expect(principal?.accountSubs.sort()).toEqual(['google-sub-1', 'google-sub-2']);
         expect(await store.getGoogleRefreshToken('google-sub-2')).toBe('google-refresh-token-B');
-        // The linked account points back at the same principal.
-        expect((await store.getGoogleUser('google-sub-2'))?.principalId).toBe(principalId);
+        // Linking records membership only: it must NOT claim the account, or
+        // signing in with it would resume someone else's principal.
+        expect(await store.getPrimaryPrincipal('google-sub-2')).toBeUndefined();
     });
 
-    it('a returning session routes /authorize to the manage page; Continue issues a code', async () => {
-        // Establish a principal and a browser session.
+    it('routes /authorize to the manage page; Continue issues a code', async () => {
         const principalId = await provider.ensurePrincipal(IDENTITY);
-        const sessionId = await provider.createSession(principalId);
 
-        // /authorize with the session cookie present → redirect to the manage page.
+        // /authorize always parks the request and redirects to the manage page.
+        // No cookie is read: any Cookie header present must be irrelevant.
         let captured = '';
         const res = {
             redirect: (u: string) => { captured = u; },
-            req: { headers: { cookie: `mcp_session=${sessionId}` } },
+            req: { headers: { cookie: 'mcp_session=stale-value-from-another-account' } },
         } as any;
         await provider.authorize(CLIENT, {
             state: 'cs', scopes: ['gmail'], redirectUri: CLIENT.redirect_uris[0],
@@ -304,13 +317,127 @@ describe('GmailOAuthProvider full flow', () => {
     });
 
     it('stores and returns a per-account send policy', async () => {
-        await provider.ensurePrincipal(IDENTITY);
-        await store.setSendPolicy(IDENTITY.sub, { allowlist: ['acme.com', 'boss@partner.com'], dangerouslyAllowAll: false });
-        const u = await store.getGoogleUser(IDENTITY.sub);
-        expect(u?.sendPolicy?.allowlist).toEqual(['acme.com', 'boss@partner.com']);
-        expect(u?.sendPolicy?.dangerouslyAllowAll).toBe(false);
+        const p = await provider.ensurePrincipal(IDENTITY);
+        await store.setSendPolicy(p, IDENTITY.sub, { allowlist: ['acme.com', 'boss@partner.com'], dangerouslyAllowAll: false });
+        const policy = await store.getSendPolicy(p, IDENTITY.sub);
+        expect(policy?.allowlist).toEqual(['acme.com', 'boss@partner.com']);
+        expect(policy?.dangerouslyAllowAll).toBe(false);
         // Survives a refresh-token upsert (no new policy supplied).
         await store.upsertGoogleUser(IDENTITY.sub, IDENTITY.email, undefined, IDENTITY.scopeNames);
-        expect((await store.getGoogleUser(IDENTITY.sub))?.sendPolicy?.allowlist).toEqual(['acme.com', 'boss@partner.com']);
+        expect((await store.getSendPolicy(p, IDENTITY.sub))?.allowlist).toEqual(['acme.com', 'boss@partner.com']);
+    });
+
+    // --- Cross-principal isolation ------------------------------------------
+    //
+    // Regression cover for the bleed where connecting a second client and signing
+    // in with an account that was merely LINKED to an existing principal handed
+    // over that whole principal: every sibling mailbox, read and send.
+
+    const SECONDARY: GoogleIdentity = {
+        sub: 'google-sub-2', email: 'shared@example.com',
+        refreshToken: 'rt-secondary', scopeNames: ['gmail.modify'],
+    };
+
+    it('a secondary-account sign-in gets its OWN principal, not the one it is linked to', async () => {
+        const p1 = await provider.ensurePrincipal(IDENTITY);
+        await provider.linkGoogleAccount(p1, SECONDARY);
+
+        // A second connection signs in with the linked (secondary) account.
+        const p2 = await provider.ensurePrincipal(SECONDARY);
+
+        expect(p2).not.toBe(p1);
+        expect((await store.getPrincipal(p2))?.accountSubs).toEqual([SECONDARY.sub]);
+        // The original principal is untouched and still owns both.
+        expect((await store.getPrincipal(p1))?.accountSubs.sort())
+            .toEqual([IDENTITY.sub, SECONDARY.sub]);
+        // Crucially, the newcomer cannot reach the primary's mailbox.
+        expect((await store.getPrincipal(p2))?.accountSubs).not.toContain(IDENTITY.sub);
+    });
+
+    it('only the primary resumes its principal; the token is bound to it', async () => {
+        const p1 = await provider.ensurePrincipal(IDENTITY);
+        await provider.linkGoogleAccount(p1, SECONDARY);
+
+        // Same primary reconnecting → same principal (reconnect must keep working).
+        expect(await provider.ensurePrincipal(IDENTITY)).toBe(p1);
+
+        // The secondary connecting elsewhere gets a token bound to its own principal.
+        const p2 = await provider.ensurePrincipal(SECONDARY);
+        const fin = await provider.finalizeAuthorization(await park(provider), p2);
+        const t = await provider.exchangeAuthorizationCode(
+            CLIENT, fin.code, undefined, CLIENT.redirect_uris[0], new URL(RESOURCE),
+        );
+        expect((await provider.verifyAccessToken(t.access_token)).extra!.principalId).toBe(p2);
+    });
+
+    it('send policy is per-principal, not shared across principals on one mailbox', async () => {
+        const p1 = await provider.ensurePrincipal(IDENTITY);
+        await provider.linkGoogleAccount(p1, SECONDARY);
+        const p2 = await provider.ensurePrincipal(SECONDARY);
+
+        await store.setSendPolicy(p1, SECONDARY.sub, { allowlist: ['a.com'], dangerouslyAllowAll: false });
+        await store.setSendPolicy(p2, SECONDARY.sub, { allowlist: [], dangerouslyAllowAll: true });
+
+        expect((await store.getSendPolicy(p1, SECONDARY.sub))?.allowlist).toEqual(['a.com']);
+        expect((await store.getSendPolicy(p1, SECONDARY.sub))?.dangerouslyAllowAll).toBe(false);
+        expect((await store.getSendPolicy(p2, SECONDARY.sub))?.dangerouslyAllowAll).toBe(true);
+    });
+
+    it('unlinking from one principal leaves the mailbox working in another', async () => {
+        const p1 = await provider.ensurePrincipal(IDENTITY);
+        await provider.linkGoogleAccount(p1, SECONDARY);
+        const p2 = await provider.ensurePrincipal(SECONDARY);
+
+        await store.unlinkAccount(p1, SECONDARY.sub);
+
+        expect((await store.getPrincipal(p1))?.accountSubs).toEqual([IDENTITY.sub]);
+        // p2 still owns it, so the shared Google grant must survive.
+        expect((await store.getPrincipal(p2))?.accountSubs).toEqual([SECONDARY.sub]);
+        expect(await store.getGoogleRefreshToken(SECONDARY.sub)).toBe('rt-secondary');
+    });
+
+    it('unlinking the last reference drops the shared Google grant', async () => {
+        const p1 = await provider.ensurePrincipal(IDENTITY);
+        await provider.linkGoogleAccount(p1, SECONDARY);
+
+        await store.unlinkAccount(p1, SECONDARY.sub);
+
+        expect(await store.getGoogleUser(SECONDARY.sub)).toBeUndefined();
+        expect(await store.getGoogleRefreshToken(SECONDARY.sub)).toBeUndefined();
+    });
+
+    it('refuses to unlink the primary', async () => {
+        const p1 = await provider.ensurePrincipal(IDENTITY);
+        await store.unlinkAccount(p1, IDENTITY.sub);
+        expect((await store.getPrincipal(p1))?.accountSubs).toEqual([IDENTITY.sub]);
+    });
+
+    it('migrates a legacy primary back-reference, but never a legacy secondary one', async () => {
+        const p1 = await provider.ensurePrincipal(IDENTITY);
+        await provider.linkGoogleAccount(p1, SECONDARY);
+
+        // Simulate pre-fix storage: both accounts carry a principalId back-ref
+        // and neither is in the primary-owner index.
+        const legacy = new FileOAuthStore(dir, encryptionKey);
+        (legacy as any).primaryOwners.clear();
+        (legacy as any).googleUsers.get(IDENTITY.sub).principalId = p1;
+        (legacy as any).googleUsers.get(SECONDARY.sub).principalId = p1;
+
+        // The real primary migrates forward and resumes.
+        expect(await legacy.getPrimaryPrincipal(IDENTITY.sub)).toBe(p1);
+        // The secondary's stale back-reference must NOT resume p1.
+        expect(await legacy.getPrimaryPrincipal(SECONDARY.sub)).toBeUndefined();
+    });
+
+    it('falls back to a legacy per-sub send policy until one is set per-principal', async () => {
+        const p1 = await provider.ensurePrincipal(IDENTITY);
+        const legacy = new FileOAuthStore(dir, encryptionKey);
+        (legacy as any).googleUsers.get(IDENTITY.sub).sendPolicy = {
+            allowlist: ['old.com'], dangerouslyAllowAll: false,
+        };
+        expect((await legacy.getSendPolicy(p1, IDENTITY.sub))?.allowlist).toEqual(['old.com']);
+
+        await legacy.setSendPolicy(p1, IDENTITY.sub, { allowlist: ['new.com'], dangerouslyAllowAll: false });
+        expect((await legacy.getSendPolicy(p1, IDENTITY.sub))?.allowlist).toEqual(['new.com']);
     });
 });

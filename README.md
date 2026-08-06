@@ -310,10 +310,12 @@ With `STORE_BACKEND=file` that hand-off is in-process, which is all a single-pro
 
 ```bash
 for c in oauth_pending_auths oauth_auth_codes oauth_access_tokens oauth_refresh_tokens \
-         oauth_link_tickets oauth_sessions oauth_auth_requests mcp_client_requests; do
+         oauth_link_tickets oauth_auth_requests mcp_client_requests; do
   gcloud firestore fields ttls update expireAt --collection-group="$c" --enable-ttl
 done
 ```
+
+**Who a connection is.** The server holds no browser session and sets no cookie: identity comes only from the Google account signed in during the connect flow. That sign-in resumes the principal it *established* (is the primary of) and nothing else. An account that was merely linked into someone's principal as a secondary never resumes that principal, so a shared or team mailbox can be linked in two places without either side inheriting the other's mailboxes. Membership and per-account send policy are stored per principal, and unlinking a mailbox from one principal leaves it working in any other that still links it.
 
 > **Security note.** Remote mode is a real multi-tenant service. Run it behind HTTPS, keep `TOKEN_ENCRYPTION_KEY` secret and stable, and treat `~/.gmail-mcp/oauth-store.json` as sensitive (it holds encrypted grants). The file-backed store is single-process; use the Firestore backend to run more than one instance. If a user revokes access in their Google account, they reconnect the connector to refresh the grant.
 

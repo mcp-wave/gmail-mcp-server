@@ -30,21 +30,41 @@ export interface GoogleUserRecord {
     refreshTokenEnc: string;
     /** Gmail scopes (shorthand) the user actually granted. */
     scopeNames: string[];
-    /** The principal this account belongs to (back-reference). */
+    /** LEGACY single-valued owner back-reference. No longer written, and never
+     *  read as an authorization decision — one Google account may be a member of
+     *  several principals. Retained only so getPrimaryPrincipal can migrate
+     *  pre-existing records forward (see that method). */
     principalId?: string;
-    /** Outbound send policy for this account (undefined => own-address-only). */
+    /** LEGACY per-account send policy, superseded by PrincipalAccountRecord.
+     *  Read as a fallback for un-migrated records; never written. */
     sendPolicy?: SendPolicy;
     updatedAt: number;
 }
 
-/** A principal = one claude.ai connection, owning one or more Google accounts. */
+/** A principal = one connection's identity, owning one or more Google accounts. */
 export interface PrincipalRecord {
     id: string;
-    /** The account used to first connect; cannot be unlinked. */
+    /** The account that established this principal. Only a sign-in as THIS
+     *  account may resume the principal; it cannot be unlinked. */
     primarySub: string;
     /** All linked account subs (includes primarySub). */
     accountSubs: string[];
     createdAt: number;
+}
+
+/**
+ * Membership of one Google account in one principal, and the settings that
+ * belong to that pairing rather than to the Google account globally.
+ *
+ * The same mailbox can legitimately be linked into two different principals
+ * (a shared or team address). Settings therefore MUST NOT live on the Google
+ * user record, or one principal's changes would apply to the other's session.
+ */
+export interface PrincipalAccountRecord {
+    principalId: string;
+    sub: string;
+    /** Outbound send policy for this account within this principal. */
+    sendPolicy?: SendPolicy;
 }
 
 /** Short-lived ticket binding an account-link / first-connect sign-in. */
@@ -53,12 +73,6 @@ export interface LinkTicketRecord {
     principalId?: string;
     /** Set when started from the manage page; return there after the callback. */
     authRequestId?: string;
-    createdAtSec: number;
-}
-
-/** A browser session (cookie) identifying a returning principal at /authorize. */
-export interface SessionRecord {
-    principalId: string;
     createdAtSec: number;
 }
 
@@ -157,21 +171,27 @@ export interface OAuthStore {
         scopeNames: string[],
     ): Promise<void>;
     getGoogleRefreshToken(sub: string): Promise<string | undefined>;
+    /** Drop the shared Google grant outright (only when Google says it is dead). */
     deleteGoogleUser(sub: string): Promise<void>;
-    setUserPrincipal(sub: string, principalId: string): Promise<void>;
-    setSendPolicy(sub: string, policy: SendPolicy): Promise<void>;
+
+    /** The principal this sub is the PRIMARY of, if any. This is the only
+     *  lookup permitted to resume an existing principal from a Google sign-in. */
+    getPrimaryPrincipal(sub: string): Promise<string | undefined>;
+    setPrimaryPrincipal(sub: string, principalId: string): Promise<void>;
+
+    getSendPolicy(principalId: string, sub: string): Promise<SendPolicy | undefined>;
+    setSendPolicy(principalId: string, sub: string, policy: SendPolicy): Promise<void>;
 
     getPrincipal(principalId: string): Promise<PrincipalRecord | undefined>;
     createPrincipal(record: PrincipalRecord): Promise<void>;
     addAccountToPrincipal(principalId: string, sub: string): Promise<void>;
-    removeAccountFromPrincipal(principalId: string, sub: string): Promise<void>;
+    /** Remove one account from one principal: drops membership and that
+     *  principal's settings, and deletes the shared Google grant only when no
+     *  other principal still links the account. */
+    unlinkAccount(principalId: string, sub: string): Promise<void>;
 
     putLinkTicket(ticket: string, record: LinkTicketRecord): Promise<void>;
     consumeLinkTicket(ticket: string, ttlSec: number): Promise<LinkTicketRecord | undefined>;
-
-    putSession(sessionId: string, record: SessionRecord): Promise<void>;
-    getSession(sessionId: string, ttlSec: number): Promise<SessionRecord | undefined>;
-    deleteSession(sessionId: string): Promise<void>;
 
     putAuthRequest(id: string, record: AuthRequestRecord): Promise<void>;
     getAuthRequest(id: string, ttlSec: number): Promise<AuthRequestRecord | undefined>;
@@ -217,9 +237,17 @@ interface PersistedShape {
     clients: Record<string, OAuthClientInformationFull>;
     googleUsers: Record<string, GoogleUserRecord>;
     principals: Record<string, PrincipalRecord>;
-    sessions: Record<string, SessionRecord>;
+    /** Keyed by `${principalId} ${sub}`. */
+    principalAccounts: Record<string, PrincipalAccountRecord>;
+    /** sub -> the principal it is the primary of. */
+    primaryOwners: Record<string, string>;
     accessTokens: Record<string, AccessTokenRecord>;
     refreshTokens: Record<string, RefreshTokenRecord>;
+}
+
+/** Composite key for a (principal, account) pairing. */
+export function accountKey(principalId: string, sub: string): string {
+    return `${principalId} ${sub}`;
 }
 
 /**
@@ -233,9 +261,10 @@ export class FileOAuthStore implements OAuthStore {
     private clients = new Map<string, OAuthClientInformationFull>();
     private googleUsers = new Map<string, GoogleUserRecord>();
     private principals = new Map<string, PrincipalRecord>();
+    private principalAccounts = new Map<string, PrincipalAccountRecord>();
+    private primaryOwners = new Map<string, string>();
     private accessTokens = new Map<string, AccessTokenRecord>();
     private refreshTokens = new Map<string, RefreshTokenRecord>();
-    private sessions = new Map<string, SessionRecord>();
     private pendingAuths = new Map<string, PendingAuthRecord>();
     private authCodes = new Map<string, AuthCodeRecord>();
     private linkTickets = new Map<string, LinkTicketRecord>();
@@ -255,7 +284,8 @@ export class FileOAuthStore implements OAuthStore {
             this.clients = new Map(Object.entries(data.clients || {}));
             this.googleUsers = new Map(Object.entries(data.googleUsers || {}));
             this.principals = new Map(Object.entries(data.principals || {}));
-            this.sessions = new Map(Object.entries(data.sessions || {}));
+            this.principalAccounts = new Map(Object.entries(data.principalAccounts || {}));
+            this.primaryOwners = new Map(Object.entries(data.primaryOwners || {}));
             this.accessTokens = new Map(Object.entries(data.accessTokens || {}));
             this.refreshTokens = new Map(Object.entries(data.refreshTokens || {}));
         } catch (err) {
@@ -268,7 +298,8 @@ export class FileOAuthStore implements OAuthStore {
             clients: Object.fromEntries(this.clients),
             googleUsers: Object.fromEntries(this.googleUsers),
             principals: Object.fromEntries(this.principals),
-            sessions: Object.fromEntries(this.sessions),
+            principalAccounts: Object.fromEntries(this.principalAccounts),
+            primaryOwners: Object.fromEntries(this.primaryOwners),
             accessTokens: Object.fromEntries(this.accessTokens),
             refreshTokens: Object.fromEntries(this.refreshTokens),
         };
@@ -408,20 +439,40 @@ export class FileOAuthStore implements OAuthStore {
         if (this.googleUsers.delete(sub)) this.persist();
     }
 
-    async setUserPrincipal(sub: string, principalId: string): Promise<void> {
-        const rec = this.googleUsers.get(sub);
-        if (rec) {
-            rec.principalId = principalId;
-            this.persist();
-        }
+    async getPrimaryPrincipal(sub: string): Promise<string | undefined> {
+        const known = this.primaryOwners.get(sub);
+        if (known) return known;
+        // Migrate a pre-index record forward, but ONLY when the legacy
+        // back-reference names a principal this sub actually established. A sub
+        // that was merely linked as a secondary gets nothing.
+        const legacy = this.googleUsers.get(sub)?.principalId;
+        if (!legacy) return undefined;
+        if (this.principals.get(legacy)?.primarySub !== sub) return undefined;
+        this.primaryOwners.set(sub, legacy);
+        this.persist();
+        return legacy;
     }
 
-    async setSendPolicy(sub: string, policy: SendPolicy): Promise<void> {
-        const rec = this.googleUsers.get(sub);
-        if (rec) {
-            rec.sendPolicy = policy;
-            this.persist();
-        }
+    async setPrimaryPrincipal(sub: string, principalId: string): Promise<void> {
+        this.primaryOwners.set(sub, principalId);
+        this.persist();
+    }
+
+    async getSendPolicy(principalId: string, sub: string): Promise<SendPolicy | undefined> {
+        const rec = this.principalAccounts.get(accountKey(principalId, sub));
+        if (rec) return rec.sendPolicy;
+        // Un-migrated: fall back to the legacy per-sub policy so an existing
+        // user's allowlist is not silently dropped on upgrade.
+        return this.googleUsers.get(sub)?.sendPolicy;
+    }
+
+    async setSendPolicy(principalId: string, sub: string, policy: SendPolicy): Promise<void> {
+        this.principalAccounts.set(accountKey(principalId, sub), {
+            principalId,
+            sub,
+            sendPolicy: policy,
+        });
+        this.persist();
     }
 
     async getPrincipal(principalId: string): Promise<PrincipalRecord | undefined> {
@@ -441,12 +492,20 @@ export class FileOAuthStore implements OAuthStore {
         }
     }
 
-    async removeAccountFromPrincipal(principalId: string, sub: string): Promise<void> {
+    async unlinkAccount(principalId: string, sub: string): Promise<void> {
         const p = this.principals.get(principalId);
-        if (p) {
-            p.accountSubs = p.accountSubs.filter((s) => s !== sub);
-            this.persist();
+        if (!p || sub === p.primarySub) return; // the primary is never unlinkable
+        p.accountSubs = p.accountSubs.filter((s) => s !== sub);
+        this.principalAccounts.delete(accountKey(principalId, sub));
+        // Keep the shared Google grant alive while any other principal links it.
+        const stillLinked = [...this.principals.values()].some((o) =>
+            o.accountSubs.includes(sub),
+        );
+        if (!stillLinked) {
+            this.googleUsers.delete(sub);
+            this.primaryOwners.delete(sub);
         }
+        this.persist();
     }
 
     async putLinkTicket(ticket: string, record: LinkTicketRecord): Promise<void> {
@@ -463,22 +522,6 @@ export class FileOAuthStore implements OAuthStore {
         this.linkTickets.delete(h);
         if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
         return rec;
-    }
-
-    async putSession(sessionId: string, record: SessionRecord): Promise<void> {
-        this.sessions.set(hashToken(sessionId), record);
-        this.persist();
-    }
-
-    async getSession(sessionId: string, ttlSec: number): Promise<SessionRecord | undefined> {
-        const rec = this.sessions.get(hashToken(sessionId));
-        if (!rec) return undefined;
-        if (nowSec() - rec.createdAtSec > ttlSec) return undefined;
-        return rec;
-    }
-
-    async deleteSession(sessionId: string): Promise<void> {
-        if (this.sessions.delete(hashToken(sessionId))) this.persist();
     }
 
     async putAuthRequest(id: string, record: AuthRequestRecord): Promise<void> {
