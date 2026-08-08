@@ -43,6 +43,8 @@ jobs:
 
       - run: npm ci
       - run: npm run lockfile:lint
+      # Production dependencies only — that is what the runtime image contains.
+      - run: npm audit --omit=dev --audit-level=critical
       - run: npm run typecheck
       - run: npm test
 

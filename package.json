@@ -72,6 +72,6 @@
     "lockfile-lint": "^5.0.0",
     "mcp-evals": "^1.0.18",
     "typescript": "^5.3.3",
-    "vitest": "^4.1.10"
+    "vitest": "^4.0.18"
   }
 }

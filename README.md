@@ -336,6 +336,8 @@ A hand-run deploy cannot answer that question, which is how a merged security fi
 
 The workflow ships **code only**. Environment variables, secrets (`TOKEN_ENCRYPTION_KEY`), scaling, and the `http` argument stay as configured on the service; change those deliberately with `gcloud`, not by editing the workflow.
 
+**What is in the image.** The Dockerfile is two-stage: the build stage compiles `dist/` with the dev toolchain, the runtime stage installs production dependencies only (`npm ci --omit=dev --ignore-scripts`) and copies `dist/` across. Neither `typescript` nor `vitest` reaches the running container, and no dependency lifecycle script runs in it. The dependency audit gate is scoped to match (`npm audit --omit=dev`), so it reports on what is actually deployed.
+
 ## OAuth Scopes
 
 You can limit the server's Gmail access by specifying OAuth scopes during authentication. This controls which tools are available to the LLM, reducing the attack surface for sensitive operations.
