@@ -65,12 +65,18 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
-      - name: Build image
+      # Built on the runner rather than with `gcloud builds submit`: that
+      # command streams from Cloud Build's default logs bucket, which requires
+      # project Viewer, so it exits non-zero on a build that actually
+      # succeeded. Building here keeps the deploy service account narrow and
+      # puts the full build log in the Actions run.
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Build and push image
         run: |
-          gcloud builds submit \
-            --project "$PROJECT_ID" \
-            --tag "$IMAGE_REPO:$GITHUB_SHA" \
-            --quiet
+          docker build -t "$IMAGE_REPO:$GITHUB_SHA" .
+          docker push "$IMAGE_REPO:$GITHUB_SHA"
 
       # Image only: env vars, secrets, scaling and args stay as configured on
       # the service. This workflow ships code, it does not own configuration.
