@@ -174,8 +174,12 @@ jobs:
       - name: Lint lockfile
         run: npm run lockfile:lint
 
+      # Scoped to what actually ships. The runtime image installs production
+      # dependencies only (see the Dockerfile's runtime stage), so a finding in
+      # the test toolchain is not a finding in the deployed service. Auditing
+      # dev tooling here only trains people to wave the gate through.
       - name: Audit dependencies
-        run: npm audit --audit-level=critical
+        run: npm audit --omit=dev --audit-level=critical
 
       - name: Typecheck
         run: npm run typecheck
