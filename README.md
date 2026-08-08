@@ -319,6 +319,23 @@ done
 
 > **Security note.** Remote mode is a real multi-tenant service. Run it behind HTTPS, keep `TOKEN_ENCRYPTION_KEY` secret and stable, and treat `~/.gmail-mcp/oauth-store.json` as sensitive (it holds encrypted grants). The file-backed store is single-process; use the Firestore backend to run more than one instance. If a user revokes access in their Google account, they reconnect the connector to refresh the grant.
 
+### Deploying
+
+`.github/workflows/deploy.yml` deploys `main` to Cloud Run. It is the only path to production; do not run `gcloud run deploy` from a workstation.
+
+Every push to `main` runs the full suite (lockfile lint, typecheck, tests) and then builds and deploys only if it passes. Authentication is Workload Identity Federation against `github-deployer@mcp-wave.iam.gserviceaccount.com`, so there are no static service account keys in the repository.
+
+The image is tagged with the commit SHA and the revision is labelled with it, so the running commit is always recoverable:
+
+```bash
+gcloud run services describe gmail-mcp --project mcp-wave --region us-central1 \
+  --format='value(spec.template.metadata.labels.commit-sha)'
+```
+
+A hand-run deploy cannot answer that question, which is how a merged security fix once sat unshipped while production served a build from an unrelated working copy.
+
+The workflow ships **code only**. Environment variables, secrets (`TOKEN_ENCRYPTION_KEY`), scaling, and the `http` argument stay as configured on the service; change those deliberately with `gcloud`, not by editing the workflow.
+
 ## OAuth Scopes
 
 You can limit the server's Gmail access by specifying OAuth scopes during authentication. This controls which tools are available to the LLM, reducing the attack surface for sensitive operations.
