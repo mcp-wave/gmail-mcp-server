@@ -57,6 +57,7 @@
     "express": "^5.2.1",
     "google-auth-library": "^9.4.1",
     "googleapis": "^129.0.0",
+    "marked": "^18.0.10",
     "mime-types": "^3.0.1",
     "nodemailer": "^7.0.11",
     "open": "^10.0.0",

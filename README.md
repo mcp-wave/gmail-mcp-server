@@ -56,7 +56,7 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 - **Download email attachments** to local filesystem
 - **Download full emails** to files in json/eml/txt/html formats
 - **Thread-level operations** — get full threads, list inbox threads, batch-expand threads
-- Support for HTML emails and multipart messages with both HTML and plain text versions
+- **Markdown bodies rendered to HTML by default** — every composed message goes out as `multipart/alternative` (rendered HTML plus a plain-text part) unless you opt out with `mimeType`
 - Full support for international characters in subject lines and email content
 - Read email messages by ID with advanced MIME structure handling
 - **Enhanced attachment display** showing filenames, types, sizes, and download IDs
@@ -448,16 +448,29 @@ The server provides the following tools that can be used through Claude Desktop:
 
 ### 1. Send Email (`send_email`)
 
-Sends a new email immediately. Supports plain text, HTML, or multipart emails **with optional file attachments**.
+Sends a new email immediately, **with optional file attachments**.
 
-Basic Email:
+The `body` is **Markdown**. By default it is rendered to HTML and sent as a
+`multipart/alternative` message: the rendered HTML plus the raw Markdown as the
+plain-text part. No `mimeType` is needed for that; pass one only to override it.
+
+Basic Email (Markdown, sent as HTML plus plain text):
+```json
+{
+  "to": ["recipient@example.com"],
+  "subject": "Meeting Tomorrow",
+  "body": "Hi,\n\nJust a reminder about our **meeting tomorrow** at 10 AM.\n\n- Bring the deck\n- Dial in early\n\nBest regards",
+  "cc": ["cc@example.com"],
+  "bcc": ["bcc@example.com"]
+}
+```
+
+**Plain text only** (opt out of HTML):
 ```json
 {
   "to": ["recipient@example.com"],
   "subject": "Meeting Tomorrow",
   "body": "Hi,\n\nJust a reminder about our meeting tomorrow at 10 AM.\n\nBest regards",
-  "cc": ["cc@example.com"],
-  "bcc": ["bcc@example.com"],
   "mimeType": "text/plain"
 }
 ```
@@ -476,29 +489,38 @@ Basic Email:
 }
 ```
 
-HTML Email Example:
+Hand-Authored HTML (bypasses Markdown rendering):
+```json
+{
+  "to": ["recipient@example.com"],
+  "subject": "Meeting Tomorrow",
+  "body": "Just a reminder about our meeting tomorrow at 10 AM.",
+  "htmlBody": "<h1>Meeting Reminder</h1><p>Just a reminder about our <b>meeting tomorrow</b> at 10 AM.</p>"
+}
+```
+
+HTML Only (no plain-text part):
 ```json
 {
   "to": ["recipient@example.com"],
   "subject": "Meeting Tomorrow",
   "mimeType": "text/html",
-  "body": "<html><body><h1>Meeting Reminder</h1><p>Just a reminder about our <b>meeting tomorrow</b> at 10 AM.</p><p>Best regards</p></body></html>"
+  "body": "## Meeting Reminder\n\nJust a reminder about our **meeting tomorrow** at 10 AM."
 }
 ```
 
-Multipart Email Example (HTML + Plain Text):
-```json
-{
-  "to": ["recipient@example.com"],
-  "subject": "Meeting Tomorrow",
-  "mimeType": "multipart/alternative",
-  "body": "Hi,\n\nJust a reminder about our meeting tomorrow at 10 AM.\n\nBest regards",
-  "htmlBody": "<html><body><h1>Meeting Reminder</h1><p>Just a reminder about our <b>meeting tomorrow</b> at 10 AM.</p><p>Best regards</p></body></html>"
-}
-```
+**Body field reference:**
+
+| Input | Result |
+| --- | --- |
+| `body` only | `multipart/alternative`: rendered HTML plus the raw Markdown as the plain-text part |
+| `body` + `htmlBody` | `multipart/alternative`, `htmlBody` used verbatim (not re-rendered) |
+| `mimeType: "text/plain"` | single `text/plain` part, Markdown left as written |
+| `mimeType: "text/html"` | single `text/html` part |
+| blank `body`, no `htmlBody` | single `text/plain` part |
 
 ### 2. Draft Email (`draft_email`)
-Creates a draft email without sending it. **Also supports attachments**.
+Creates a draft email without sending it. **Also supports attachments**. The `body` is Markdown and follows the same HTML-by-default rules as `send_email`.
 
 ```json
 {
@@ -717,32 +739,30 @@ Replies to all recipients of an email. Automatically fetches the original email 
 2. Builds **To** from the original sender (From header)
 3. Builds **CC** from original To + CC, excluding your own email
 4. Sets threading headers so the reply lands in the correct thread
-5. Sends via the existing `send_email` pipeline (supports attachments, HTML, multipart)
+5. Sends via the existing `send_email` pipeline, so the same Markdown-to-HTML default, attachments and `mimeType` overrides apply
 
 ```json
 {
   "messageId": "182ab45cd67ef",
-  "body": "Thanks for the update, everyone. I'll review and get back to you.",
-  "mimeType": "text/plain"
+  "body": "Thanks for the update, everyone. I'll review and **get back to you** today."
 }
 ```
 
-**With HTML and attachments:**
+**With hand-authored HTML and attachments:**
 ```json
 {
   "messageId": "182ab45cd67ef",
-  "body": "Plain text fallback",
+  "body": "Thanks for the update. See attached notes.",
   "htmlBody": "<p>Thanks for the update. See attached notes.</p>",
-  "mimeType": "multipart/alternative",
   "attachments": ["/path/to/notes.pdf"]
 }
 ```
 
 Parameters:
 - `messageId` (required): ID of the email to reply to
-- `body` (required): Reply body (plain text, or fallback when using multipart)
-- `htmlBody` (optional): HTML version of the reply body
-- `mimeType` (optional): `text/plain` (default), `text/html`, or `multipart/alternative`
+- `body` (required): Reply body in Markdown, rendered to HTML by default
+- `htmlBody` (optional): Explicit HTML body, used verbatim instead of the rendered Markdown
+- `mimeType` (optional): override the default `multipart/alternative`; `text/plain` for plain text only, `text/html` for HTML only
 - `attachments` (optional): Array of file paths to attach
 
 ### 21. Modify Thread (`modify_thread`)
@@ -787,7 +807,7 @@ Atomically sends an existing draft via `users.drafts.send` and removes it from t
 ```
 
 ### 25. Update Draft (`update_draft`)
-Replaces a draft's content in place via `users.drafts.update`, **preserving the draft ID**. Critical for iteration loops (draft → user requests changes → re-draft) so Drafts doesn't accumulate N copies. Reuses the same MIME builder as `draft_email`, so attachment and threading semantics match.
+Replaces a draft's content in place via `users.drafts.update`, **preserving the draft ID**. Critical for iteration loops (draft → user requests changes → re-draft) so Drafts doesn't accumulate N copies. Reuses the same MIME builder as `draft_email`, so body rendering, attachment and threading semantics match.
 
 ```json
 {
