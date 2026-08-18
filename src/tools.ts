@@ -5,10 +5,10 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 export const SendEmailSchema = z.object({
   to: z.array(z.string()).describe("List of recipient email addresses"),
   subject: z.string().describe("Email subject"),
-  body: z.string().describe("Email body content (used for text/plain or when htmlBody not provided)"),
+  body: z.string().describe("Email body in Markdown. Rendered to HTML and sent as multipart/alternative (HTML plus this text as the plain-text part) by default."),
   from: z.string().optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
-  htmlBody: z.string().optional().describe("HTML version of the email body"),
-  mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
+  htmlBody: z.string().optional().describe("Explicit HTML body. Overrides the HTML rendered from the Markdown body; only needed for hand-authored HTML."),
+  mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().describe("Override the content type. Omit for the default multipart/alternative (Markdown-rendered HTML plus plain text). Use 'text/plain' only when a plain-text-only message is explicitly required."),
   cc: z.array(z.string()).optional().describe("List of CC recipients"),
   bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
   threadId: z.string().optional().describe("Thread ID to reply to"),
@@ -49,10 +49,10 @@ export const UpdateDraftSchema = z.object({
   draftId: z.string().describe("ID of the draft to update"),
   to: z.array(z.string()).describe("List of recipient email addresses"),
   subject: z.string().describe("Email subject"),
-  body: z.string().describe("Email body content (used for text/plain or when htmlBody not provided)"),
+  body: z.string().describe("Email body in Markdown. Rendered to HTML and sent as multipart/alternative (HTML plus this text as the plain-text part) by default."),
   from: z.string().optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
-  htmlBody: z.string().optional().describe("HTML version of the email body"),
-  mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
+  htmlBody: z.string().optional().describe("Explicit HTML body. Overrides the HTML rendered from the Markdown body; only needed for hand-authored HTML."),
+  mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().describe("Override the content type. Omit for the default multipart/alternative (Markdown-rendered HTML plus plain text). Use 'text/plain' only when a plain-text-only message is explicitly required."),
   cc: z.array(z.string()).optional().describe("List of CC recipients"),
   bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
   threadId: z.string().optional().describe("Thread ID to reply to"),
@@ -198,9 +198,9 @@ export const GetInboxWithThreadsSchema = z.object({
 // Reply All schema - fetches original email and builds recipient list automatically
 export const ReplyAllSchema = z.object({
   messageId: z.string().describe("ID of the email message to reply to"),
-  body: z.string().describe("Reply body content (used for text/plain or when htmlBody not provided)"),
-  htmlBody: z.string().optional().describe("HTML version of the reply body"),
-  mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
+  body: z.string().describe("Reply body in Markdown. Rendered to HTML and sent as multipart/alternative (HTML plus this text as the plain-text part) by default."),
+  htmlBody: z.string().optional().describe("Explicit HTML body. Overrides the HTML rendered from the Markdown body; only needed for hand-authored HTML."),
+  mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().describe("Override the content type. Omit for the default multipart/alternative (Markdown-rendered HTML plus plain text). Use 'text/plain' only when a plain-text-only message is explicitly required."),
   attachments: z.array(z.string()).optional().describe("List of file paths to attach to the reply"),
   from: z.string().optional().describe("Send the reply as this address (must be a configured send-as alias in Gmail settings). Defaults to the account's default send-as address. Use list_send_as to discover available aliases."),
 });
@@ -289,14 +289,14 @@ export const toolDefinitions: ToolDefinition[] = [
   // Email write operations
   {
     name: "send_email",
-    description: "Sends a new email",
+    description: "Sends a new email. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
     schema: SendEmailSchema,
     scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
     annotations: { title: "Send Email", destructiveHint: false },
   },
   {
     name: "draft_email",
-    description: "Draft a new email",
+    description: "Draft a new email. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
     schema: SendEmailSchema,
     scopes: ["gmail.modify", "gmail.compose"],
     annotations: { title: "Draft Email", destructiveHint: false },
@@ -317,7 +317,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "update_draft",
-    description: "Replaces the content of an existing draft. Use during iteration (\"change this and that\") instead of creating a new draft each time — avoids accumulating draft copies in the user's Drafts folder.",
+    description: "Replaces the content of an existing draft. Use during iteration (\"change this and that\") instead of creating a new draft each time — avoids accumulating draft copies in the user's Drafts folder. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
     schema: UpdateDraftSchema,
     scopes: ["gmail.modify", "gmail.compose"],
     annotations: { title: "Update Draft", destructiveHint: false },
@@ -463,7 +463,7 @@ export const toolDefinitions: ToolDefinition[] = [
   // Reply-all operation
   {
     name: "reply_all",
-    description: "Replies to all recipients of an email. Automatically fetches the original email to build the recipient list (To, CC) and sets proper threading headers.",
+    description: "Replies to all recipients of an email. Automatically fetches the original email to build the recipient list (To, CC) and sets proper threading headers. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
     schema: ReplyAllSchema,
     scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
     annotations: { title: "Reply All", destructiveHint: false },
