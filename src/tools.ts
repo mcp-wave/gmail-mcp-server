@@ -45,19 +45,29 @@ export const DeleteDraftSchema = z.object({
   draftId: z.string().describe("ID of the draft to delete"),
 });
 
+export const ReadDraftSchema = z.object({
+  draftId: z.string().describe("ID of the draft to read"),
+});
+
+export const ListDraftsSchema = z.object({
+  maxResults: z.number().optional().describe("Maximum number of drafts to return (default 25)"),
+});
+
 export const UpdateDraftSchema = z.object({
   draftId: z.string().describe("ID of the draft to update"),
-  to: z.array(z.string()).describe("List of recipient email addresses"),
-  subject: z.string().describe("Email subject"),
-  body: z.string().describe("Email body in Markdown. Rendered to HTML and sent as multipart/alternative (HTML plus this text as the plain-text part) by default."),
+  baseToken: z.string().describe("The baseToken returned by read_draft for this draft. Required: it proves the edit was built on the draft's current content. If the draft changed since that read, the edit is refused rather than overwriting the user's changes."),
+  to: z.array(z.string()).optional().describe("Replace the recipients. Omit to keep the draft's existing recipients."),
+  subject: z.string().optional().describe("Replace the subject. Omit to keep the draft's existing subject."),
+  body: z.string().optional().describe("Replace the body, in Markdown. Omit to keep the draft's existing body. Supplying this discards whatever the body currently holds, so read the draft first and fold in any changes the user made."),
   from: z.string().optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
-  htmlBody: z.string().optional().describe("Explicit HTML body. Overrides the HTML rendered from the Markdown body; only needed for hand-authored HTML."),
+  htmlBody: z.string().optional().describe("Explicit HTML body, replacing the rendered Markdown. Omit to keep the draft's existing HTML."),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().describe("Override the content type. Omit for the default multipart/alternative (Markdown-rendered HTML plus plain text). Use 'text/plain' only when a plain-text-only message is explicitly required."),
-  cc: z.array(z.string()).optional().describe("List of CC recipients"),
-  bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
+  cc: z.array(z.string()).optional().describe("Replace the CC list. Omit to keep the draft's existing CC list."),
+  bcc: z.array(z.string()).optional().describe("Replace the BCC list. Omit to keep the draft's existing BCC list."),
   threadId: z.string().optional().describe("Thread ID to reply to"),
   inReplyTo: z.string().optional().describe("Message ID being replied to"),
-  attachments: z.array(z.string()).optional().describe("List of file paths to attach to the email"),
+  attachments: z.array(z.string()).optional().describe("File paths to attach, replacing the draft's current attachments. An edit to a draft that already has attachments must either re-supply them here or set dropAttachments, because Gmail holds the bytes and they cannot be rebuilt from the draft."),
+  dropAttachments: z.boolean().optional().describe("Deliberately remove the draft's existing attachments. Only needed when the draft has attachments and you are not re-supplying them."),
 });
 
 export const ListEmailLabelsSchema = z.object({}).describe("Retrieves all available Gmail labels");
@@ -344,8 +354,22 @@ export const toolDefinitions: ToolDefinition[] = [
     annotations: { title: "Delete Draft", destructiveHint: true },
   },
   {
+    name: "read_draft",
+    description: "Reads an outstanding draft's current content: recipients, subject, body and attachments, plus a baseToken. Call this before update_draft, always. The user may have edited the draft in Gmail since you last saw it, and update_draft requires the baseToken from this read so an edit cannot silently discard their changes.",
+    schema: ReadDraftSchema,
+    scopes: ["gmail.readonly", "gmail.modify", "gmail.compose"],
+    annotations: { title: "Read Draft", readOnlyHint: true },
+  },
+  {
+    name: "list_drafts",
+    description: "Lists the outstanding drafts in the mailbox with their recipients, subject and a snippet, so a draft can be found by what it says rather than by remembering its ID. Use read_draft for a draft's full content.",
+    schema: ListDraftsSchema,
+    scopes: ["gmail.readonly", "gmail.modify", "gmail.compose"],
+    annotations: { title: "List Drafts", readOnlyHint: true },
+  },
+  {
     name: "update_draft",
-    description: "Replaces the content of an existing draft. Use during iteration (\"change this and that\") instead of creating a new draft each time — avoids accumulating draft copies in the user's Drafts folder. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
+    description: "Revises an existing draft in place, keeping its ID. Requires the baseToken from read_draft: the draft is re-read at edit time and the edit refused if it changed since that read, so revisions cannot overwrite what the user wrote in Gmail. Fields you omit keep their current values, so changing only the subject leaves the body alone. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
     schema: UpdateDraftSchema,
     scopes: ["gmail.modify", "gmail.compose"],
     annotations: { title: "Update Draft", destructiveHint: false },
