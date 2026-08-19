@@ -57,6 +57,8 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 - **Download full emails** to files in json/eml/txt/html formats
 - **Thread-level operations** — get full threads, list inbox threads, batch-expand threads
 - **Markdown bodies rendered to HTML by default** — every composed message goes out as `multipart/alternative` (rendered HTML plus a plain-text part) unless you opt out with `mimeType`
+- **No more stranded drafts** — trashing a draft is refused (it leaves a message Gmail calls deleted but IMAP clients still list as a draft), and `repair_drafts` cleans up any already in that state
+- **Draft edits cannot clobber your own changes** — revising a draft requires reading it first, the edit is refused if the draft changed since that read, and fields you omit keep their current values
 - Full support for international characters in subject lines and email content
 - Read email messages by ID with advanced MIME structure handling
 - **Enhanced attachment display** showing filenames, types, sizes, and download IDs
@@ -382,9 +384,15 @@ The server automatically filters available tools based on your authorized scopes
 | `list_email_labels` | `gmail.readonly`, `gmail.modify`, or `gmail.labels` |
 | `send_email`, `draft_email`, `reply_all`, `send_draft` | `gmail.modify`, `gmail.compose`, or `gmail.send` |
 | `delete_draft`, `update_draft` | `gmail.modify` or `gmail.compose` |
+| `read_draft`, `list_drafts` | `gmail.readonly`, `gmail.modify`, or `gmail.compose` |
 | `modify_email`, `delete_email`, `batch_modify_emails`, `batch_delete_emails`, `modify_thread`, `report_phishing`, `batch_report_phishing` | `gmail.modify` |
+| `find_stranded_drafts` | `gmail.readonly` or `gmail.modify` |
+| `repair_drafts` | `gmail.modify` |
 | `create_label`, `update_label`, `delete_label`, `get_or_create_label` | `gmail.modify` or `gmail.labels` |
 | `list_filters`, `get_filter`, `create_filter`, `delete_filter`, `create_filter_from_template` | `gmail.settings.basic` |
+| `get_settings` | `gmail.readonly`, `gmail.modify`, or `gmail.settings.basic` |
+| `set_signature`, `update_send_as` | `gmail.settings.basic` or `gmail.settings.sharing` |
+| `set_vacation_responder` | `gmail.settings.basic` |
 
 ### Re-authenticating
 
@@ -806,21 +814,97 @@ Atomically sends an existing draft via `users.drafts.send` and removes it from t
 }
 ```
 
-### 25. Update Draft (`update_draft`)
-Replaces a draft's content in place via `users.drafts.update`, **preserving the draft ID**. Critical for iteration loops (draft → user requests changes → re-draft) so Drafts doesn't accumulate N copies. Reuses the same MIME builder as `draft_email`, so body rendering, attachment and threading semantics match.
+### 25. Read Draft (`read_draft`)
+
+Reads an outstanding draft's current content, plus the `baseToken` that `update_draft` requires.
+
+```json
+{
+  "draftId": "r-1234567890123456789"
+}
+```
+
+Returns the recipients, subject, both body representations, any attachments, and:
+
+```
+baseToken: v1:msg-abc123:hist-456
+```
+
+**Call this before every `update_draft`.** The user may have opened the draft in Gmail and rewritten it since the agent last saw it.
+
+### 26. List Drafts (`list_drafts`)
+
+Lists outstanding drafts with recipients, subject and a snippet, so a draft can be found by what it says rather than by a remembered ID.
+
+```json
+{
+  "maxResults": 25
+}
+```
+
+A draft whose metadata cannot be read is listed with the reason, rather than omitted. Dropping it would understate how many drafts the mailbox holds.
+
+### 27. Update Draft (`update_draft`)
+
+Revises a draft in place via `users.drafts.update`, **preserving the draft ID**, so an iteration loop does not accumulate copies in Drafts.
 
 ```json
 {
   "draftId": "r-1234567890123456789",
-  "to": ["recipient@example.com"],
-  "subject": "Revised Report",
-  "body": "Updated draft content.",
-  "cc": ["manager@example.com"],
-  "attachments": ["/path/to/report.docx"]
+  "baseToken": "v1:msg-abc123:hist-456",
+  "subject": "Revised Report"
 }
 ```
 
-### 26. Delete Draft (`delete_draft`)
+#### It cannot overwrite what you wrote
+
+`drafts.update` is documented as "Replaces a draft's content": the whole message is rebuilt from what the caller supplies. That makes the obvious implementation destructive, because an agent revising a draft you have since edited will happily rebuild it from its own stale memory.
+
+Three things prevent that:
+
+**1. An edit must prove it read the draft.** `baseToken` is required. Without it the edit is refused:
+
+```
+Editing a draft requires the current content. Call read_draft on "r-123..." first,
+then pass its baseToken back.
+```
+
+**2. The draft is re-read at edit time and the token compared.** If it changed since you read it, the edit is refused *and the current content is handed back* so the agent can fold your changes in:
+
+```
+This draft changed after you read it, so the edit was refused to avoid overwriting
+those changes. You based the edit on "v1:msg-abc:hist-456" but the draft is now at
+"v1:msg-def:hist-789".
+```
+
+The token is `v1:<messageId>:<historyId>`. Both halves are compared because Gmail documents [`Message.historyId`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages) as "The ID of the last history record that modified this message", while `Message.id` is immutable for a given message but an edit may swap the message out entirely. Comparing both is correct either way, so the guard does not depend on which one Gmail does.
+
+**3. Omitted fields are preserved, not blanked.** `to`, `subject`, `body`, `cc` and `bcc` are all optional now. Anything you leave out is carried over from the live draft, so changing the subject leaves a body you rewrote untouched. The response says what it did:
+
+```
+Draft r-123... updated (ID unchanged). Changes: replaced subject; kept the draft's
+existing to, body, cc, bcc.
+New baseToken for further edits: v1:msg-ghi:hist-012
+```
+
+That new token means consecutive edits do not need another `read_draft` between them.
+
+#### Attachments
+
+An edit to a draft that already has attachments is **refused** unless you either re-supply them with `attachments` or pass `dropAttachments: true`:
+
+```
+This draft has 1 attachment(s) (contract.pdf) that an edit cannot preserve: Gmail
+holds the bytes and rebuilding the message needs local file paths.
+```
+
+Gmail stores the attachment bytes, and rebuilding the MIME body requires the original local file paths, which this server does not retain between calls. Silently dropping them was the old behavior.
+
+#### One thing that is not preserved
+
+Display names in recipient headers. `Jason Waldrip <jason@example.com>` is preserved as `jason@example.com`, because the message builder validates recipients as bare addresses. Delivery is unaffected.
+
+### 28. Delete Draft (`delete_draft`)
 Discards an abandoned draft via `users.drafts.delete`.
 
 ```json
@@ -834,12 +918,134 @@ Discards an abandoned draft via `users.drafts.delete`.
 ```
 draft_email(...) → draftId
   ↓ (user wants changes)
-update_draft(draftId, ...)   // mutate in place, same ID
+read_draft(draftId) → baseToken + current content   // always, the user may have edited it
+  ↓
+update_draft(draftId, baseToken, ...)               // mutate in place, same ID
   ↓ (user confirms)
-send_draft(draftId)          // atomic send + draft removal
+send_draft(draftId)                                  // atomic send + draft removal
 ```
 
 Or abort: `delete_draft(draftId)`.
+
+### 33. Find Stranded Drafts (`find_stranded_drafts`)
+
+Finds messages holding both the `DRAFT` and `TRASH` labels.
+
+```json
+{}
+```
+
+Gmail labels are not exclusive, so a message can be both a draft and trashed. The two client families then disagree about what it is: **Gmail's web UI honours `TRASH`** and collapses the message into the "N deleted messages in this conversation" affordance, while **IMAP clients (Apple Mail, Outlook, Thunderbird) map labels onto folders**, so `DRAFT` still present means the message keeps showing up in the Drafts folder, indefinitely, as something you can open and try to edit.
+
+This state comes from trashing a draft *message* (adding the `TRASH` label) instead of discarding the *draft* (`delete_draft`). `trash_email` and `batch_trash_emails` now refuse to trash a draft for exactly this reason, so the state should not arise again; this tool finds any that already exist.
+
+### 34. Repair Stranded Drafts (`repair_drafts`)
+
+Resolves DRAFT+TRASH messages into one consistent state, in either direction:
+
+```json
+{
+  "mode": "restore",
+  "messageIds": ["optional", "specific", "ids"]
+}
+```
+
+| Mode | Removes | Result |
+| --- | --- | --- |
+| `restore` | `TRASH` | A live draft again, visible and editable in Gmail **and** IMAP clients |
+| `discard` | `DRAFT` | An ordinary trashed message; IMAP Drafts folders stop listing it; Gmail purges it on its own schedule |
+
+Neither mode deletes anything. The message and its content stay in the mailbox either way, so a wrong choice is recoverable by re-adding the other label with `modify_email`. Omit `messageIds` to repair every stranded draft in the mailbox.
+
+> **Guards at every sink:** `trash_email`, `batch_trash_emails`, `modify_email`, `batch_modify_emails` and `modify_thread` all refuse to add `TRASH` to a draft. Discard drafts with `delete_draft`.
+
+### 35. Get Mailbox Settings (`get_settings`)
+
+Reads the whole `users.settings` surface in one call: send-as addresses and their signatures, vacation responder, auto-forwarding, forwarding addresses, delegates, IMAP, POP and display language.
+
+```json
+{}
+```
+
+**Each section reports its own state.** Some settings are only readable by domain-wide-delegated service accounts (`delegates.list` is documented that way), so under normal per-user OAuth that section is refused. When a read fails the section says so:
+
+```
+## Delegates
+Could not read this section: not permitted (403): Delegation is not supported for this account.
+```
+
+It never prints `None configured.` for a section it could not read. "No delegates" and "not allowed to ask about delegates" are different answers, and only one of them is safe to act on. `None configured.` appears only when the read actually succeeded and came back empty.
+
+This makes the tool usable as a quick exfiltration check: auto-forwarding and forwarding addresses are readable with ordinary scopes, so you can see whether anything is siphoning mail out of the account.
+
+### 36. Set Signature (`set_signature`)
+
+Sets the Gmail signature on a send-as address. The signature is **Markdown**, rendered to HTML before saving, consistent with how message bodies work.
+
+```json
+{
+  "signature": "**Jason Waldrip**\nCTO\n[imacto.com](https://imacto.com)"
+}
+```
+
+Targets the account's default From address unless `sendAsEmail` names another. Pass `signatureHtml` instead to save hand-authored HTML verbatim, or `"signature": ""` to clear it.
+
+> **This is the web-UI signature.** Gmail documents `signature` as the signature added when composing **in the Gmail web interface**. It is *not* appended to mail sent through this server's `send_email` / `reply_all` tools. To sign an API-sent message, put the signature in the body.
+
+Gmail sanitizes signature HTML server-side. The tool reads back what Gmail stored and tells you when it differs from what was sent.
+
+### 37. Update Send-As Address (`update_send_as`)
+
+Updates the identity fields of a send-as address. Uses `sendAs.patch`, so fields you do not pass are left alone.
+
+```json
+{
+  "displayName": "Jason Waldrip",
+  "replyToAddress": "jason@example.com"
+}
+```
+
+| Field | Notes |
+| --- | --- |
+| `displayName` | Name in the From header. Empty string clears it. |
+| `replyToAddress` | Adds a Reply-To header. Empty string removes it. |
+| `treatAsAlias` | Custom From addresses only. |
+| `makeDefault` | Only `true` is accepted: an account always has exactly one default, changed by promoting another address. |
+
+Gmail documents that a `displayName` update on the primary address **silently fails** when an admin has disabled name changes: the request succeeds and nothing changes. This tool compares the response against what it asked for and reports any field Gmail accepted but ignored, rather than claiming success.
+
+Use `set_signature` for the signature; this tool does not touch it.
+
+### 38. Set Vacation Responder (`set_vacation_responder`)
+
+Turns the out-of-office auto-reply on or off.
+
+```json
+{
+  "enabled": true,
+  "subject": "Out of office",
+  "body": "I'm away until **Monday**. For anything urgent, contact the team.",
+  "startTime": "2026-08-20",
+  "endTime": "2026-08-27T17:00:00-07:00"
+}
+```
+
+- `body` is Markdown, rendered to HTML. `bodyHtml` saves HTML verbatim.
+- `startTime` / `endTime` accept an ISO date or datetime. **A bare date means UTC midnight**, so pass an offset when the exact local hour matters. Both are optional; with neither, the responder runs until turned off.
+- `restrictToContacts` limits replies to your contacts; `restrictToDomain` limits them to your own domain (Workspace only).
+
+`updateVacation` replaces the entire resource, so this tool reads the current settings and merges your fields over them. Changing only the subject keeps the existing body, and `{"enabled": false}` turns the responder off without discarding the stored message.
+
+Gmail requires a nonempty subject or body to enable the responder. That is checked against the merged result, so enabling against a body you set earlier works without repeating it.
+
+### Settings this server deliberately does not write
+
+| Setting | Why not |
+| --- | --- |
+| Auto-forwarding | `updateAutoForwarding` is documented as "only available to service account clients that have been delegated domain-wide authority". Under this server's per-user OAuth it cannot succeed, so there is no tool for it. Reading it works and is included in `get_settings`. |
+| Delegates, forwarding-address creation | Same domain-wide-delegation restriction. |
+| Send-as alias create / delete / verify | Require `gmail.settings.sharing` plus domain-wide delegation for addresses other than the primary. |
+| IMAP, POP, display language | Readable via `get_settings`. These are one-time client-setup toggles; an agent changing them on your behalf is almost always wrong, so they are read-only here. |
 
 ## Filter Management Features
 

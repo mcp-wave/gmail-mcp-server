@@ -45,19 +45,29 @@ export const DeleteDraftSchema = z.object({
   draftId: z.string().describe("ID of the draft to delete"),
 });
 
+export const ReadDraftSchema = z.object({
+  draftId: z.string().describe("ID of the draft to read"),
+});
+
+export const ListDraftsSchema = z.object({
+  maxResults: z.number().optional().describe("Maximum number of drafts to return (default 25)"),
+});
+
 export const UpdateDraftSchema = z.object({
   draftId: z.string().describe("ID of the draft to update"),
-  to: z.array(z.string()).describe("List of recipient email addresses"),
-  subject: z.string().describe("Email subject"),
-  body: z.string().describe("Email body in Markdown. Rendered to HTML and sent as multipart/alternative (HTML plus this text as the plain-text part) by default."),
+  baseToken: z.string().describe("The baseToken returned by read_draft for this draft. Required: it proves the edit was built on the draft's current content. If the draft changed since that read, the edit is refused rather than overwriting the user's changes."),
+  to: z.array(z.string()).optional().describe("Replace the recipients. Omit to keep the draft's existing recipients."),
+  subject: z.string().optional().describe("Replace the subject. Omit to keep the draft's existing subject."),
+  body: z.string().optional().describe("Replace the body, in Markdown. Omit to keep the draft's existing body. Supplying this discards whatever the body currently holds, so read the draft first and fold in any changes the user made."),
   from: z.string().optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
-  htmlBody: z.string().optional().describe("Explicit HTML body. Overrides the HTML rendered from the Markdown body; only needed for hand-authored HTML."),
+  htmlBody: z.string().optional().describe("Explicit HTML body, replacing the rendered Markdown. Omit to keep the draft's existing HTML."),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().describe("Override the content type. Omit for the default multipart/alternative (Markdown-rendered HTML plus plain text). Use 'text/plain' only when a plain-text-only message is explicitly required."),
-  cc: z.array(z.string()).optional().describe("List of CC recipients"),
-  bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
+  cc: z.array(z.string()).optional().describe("Replace the CC list. Omit to keep the draft's existing CC list."),
+  bcc: z.array(z.string()).optional().describe("Replace the BCC list. Omit to keep the draft's existing BCC list."),
   threadId: z.string().optional().describe("Thread ID to reply to"),
   inReplyTo: z.string().optional().describe("Message ID being replied to"),
-  attachments: z.array(z.string()).optional().describe("List of file paths to attach to the email"),
+  attachments: z.array(z.string()).optional().describe("File paths to attach, replacing the draft's current attachments. An edit to a draft that already has attachments must either re-supply them here or set dropAttachments, because Gmail holds the bytes and they cannot be rebuilt from the draft."),
+  dropAttachments: z.boolean().optional().describe("Deliberately remove the draft's existing attachments. Only needed when the draft has attachments and you are not re-supplying them."),
 });
 
 export const ListEmailLabelsSchema = z.object({}).describe("Retrieves all available Gmail labels");
@@ -207,6 +217,43 @@ export const ReplyAllSchema = z.object({
 
 export const ListSendAsSchema = z.object({});
 
+// Draft integrity: messages holding both DRAFT and TRASH, which Gmail hides as
+// deleted while IMAP clients keep listing them in Drafts.
+export const FindStrandedDraftsSchema = z.object({});
+
+export const RepairDraftsSchema = z.object({
+  mode: z.enum(['restore', 'discard']).describe("restore: remove TRASH so the message is a live draft again in both Gmail and IMAP clients. discard: remove DRAFT so it is an ordinary trashed message and stops appearing in IMAP Drafts folders. Neither mode deletes anything."),
+  messageIds: z.array(z.string()).optional().describe("Limit the repair to these message IDs. Omit to repair every stranded draft in the mailbox."),
+});
+
+// Mailbox settings schemas (users.settings.*)
+export const GetSettingsSchema = z.object({});
+
+export const SetSignatureSchema = z.object({
+  signature: z.string().optional().describe("Signature in Markdown, rendered to HTML before saving. Pass an empty string to clear the signature."),
+  signatureHtml: z.string().optional().describe("Explicit HTML signature, saved verbatim. Overrides the HTML rendered from the Markdown signature; only needed for hand-authored HTML."),
+  sendAsEmail: z.string().optional().describe("Which send-as address to change. Defaults to the account's default From address. Use list_send_as to see the options."),
+});
+
+export const UpdateSendAsSchema = z.object({
+  sendAsEmail: z.string().optional().describe("Which send-as address to change. Defaults to the account's default From address. Use list_send_as to see the options."),
+  displayName: z.string().optional().describe("Name shown in the From header. Pass an empty string to clear it. Gmail silently ignores this for the primary address when an admin has disabled name changes; the tool reports when that happens."),
+  replyToAddress: z.string().optional().describe("Address to put in the Reply-To header for mail sent from this alias. Pass an empty string to remove the header."),
+  treatAsAlias: z.boolean().optional().describe("Whether Gmail treats this address as an alias of the primary address. Applies only to custom From addresses."),
+  makeDefault: z.literal(true).optional().describe("Promote this address to the default From address. Only true is accepted: an account always has exactly one default, changed by promoting another address."),
+});
+
+export const SetVacationResponderSchema = z.object({
+  enabled: z.boolean().describe("Turn the vacation responder on or off. Turning it off leaves the stored subject and body in place."),
+  subject: z.string().optional().describe("Subject prefix for auto-replies. Gmail needs a nonempty subject or body to enable the responder."),
+  body: z.string().optional().describe("Auto-reply body in Markdown, rendered to HTML before saving."),
+  bodyHtml: z.string().optional().describe("Explicit HTML auto-reply body, saved verbatim. Overrides the HTML rendered from the Markdown body."),
+  startTime: z.string().optional().describe("When to start auto-replying, as an ISO date (2026-08-20) or datetime (2026-08-20T09:00:00-07:00). A bare date is treated as UTC midnight, so pass an offset if the exact local hour matters."),
+  endTime: z.string().optional().describe("When to stop auto-replying, same format as startTime. Must be after startTime."),
+  restrictToContacts: z.boolean().optional().describe("Only auto-reply to senders in the user's contacts."),
+  restrictToDomain: z.boolean().optional().describe("Only auto-reply to senders inside the user's own domain. Google Workspace accounts only."),
+});
+
 // Tool definition type
 export interface ToolAnnotations {
   title: string;
@@ -316,8 +363,22 @@ export const toolDefinitions: ToolDefinition[] = [
     annotations: { title: "Delete Draft", destructiveHint: true },
   },
   {
+    name: "read_draft",
+    description: "Reads an outstanding draft's current content: recipients, subject, body and attachments, plus a baseToken. Call this before update_draft, always. The user may have edited the draft in Gmail since you last saw it, and update_draft requires the baseToken from this read so an edit cannot silently discard their changes.",
+    schema: ReadDraftSchema,
+    scopes: ["gmail.readonly", "gmail.modify", "gmail.compose"],
+    annotations: { title: "Read Draft", readOnlyHint: true },
+  },
+  {
+    name: "list_drafts",
+    description: "Lists the outstanding drafts in the mailbox with their recipients, subject and a snippet, so a draft can be found by what it says rather than by remembering its ID. Use read_draft for a draft's full content.",
+    schema: ListDraftsSchema,
+    scopes: ["gmail.readonly", "gmail.modify", "gmail.compose"],
+    annotations: { title: "List Drafts", readOnlyHint: true },
+  },
+  {
     name: "update_draft",
-    description: "Replaces the content of an existing draft. Use during iteration (\"change this and that\") instead of creating a new draft each time — avoids accumulating draft copies in the user's Drafts folder. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
+    description: "Revises an existing draft in place, keeping its ID. Requires the baseToken from read_draft: the draft is re-read at edit time and the edit refused if it changed since that read, so revisions cannot overwrite what the user wrote in Gmail. Fields you omit keep their current values, so changing only the subject leaves the body alone. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
     schema: UpdateDraftSchema,
     scopes: ["gmail.modify", "gmail.compose"],
     annotations: { title: "Update Draft", destructiveHint: false },
@@ -331,17 +392,31 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "trash_email",
-    description: "Moves an email to Trash (recoverable for 30 days). Prefer this over delete_email — delete_email is a permanent, irreversible delete.",
+    description: "Moves an email to Trash (recoverable for 30 days). Prefer this over delete_email — delete_email is a permanent, irreversible delete. Refuses to trash a draft: that would leave the message holding both DRAFT and TRASH, which hides it from Gmail while IMAP clients such as Apple Mail keep listing it in Drafts. Discard drafts with delete_draft instead.",
     schema: TrashEmailSchema,
     scopes: ["gmail.modify"],
     annotations: { title: "Trash Email", destructiveHint: false, idempotentHint: true },
   },
   {
     name: "batch_trash_emails",
-    description: "Moves multiple emails to Trash (recoverable for 30 days). Prefer this over batch_delete_emails for clearing the inbox.",
+    description: "Moves multiple emails to Trash (recoverable for 30 days). Prefer this over batch_delete_emails for clearing the inbox. If any id in the batch is a draft, nothing is trashed and every offending id is named, because trashing a draft strands it as visible in IMAP clients but deleted in Gmail.",
     schema: BatchTrashEmailsSchema,
     scopes: ["gmail.modify"],
     annotations: { title: "Batch Trash Emails", destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "find_stranded_drafts",
+    description: "Finds messages holding both the DRAFT and TRASH labels. Gmail hides these as \"N deleted messages in this conversation\" while IMAP clients such as Apple Mail keep listing them in the Drafts folder, so the same message looks deleted in one client and editable in another. Use repair_drafts to resolve them.",
+    schema: FindStrandedDraftsSchema,
+    scopes: ["gmail.readonly", "gmail.modify"],
+    annotations: { title: "Find Stranded Drafts", readOnlyHint: true },
+  },
+  {
+    name: "repair_drafts",
+    description: "Resolves messages stuck holding both DRAFT and TRASH into one consistent state. mode \"restore\" removes TRASH so they are live drafts again in Gmail and in IMAP clients; mode \"discard\" removes DRAFT so they are ordinary trashed messages. Neither mode deletes anything, so a wrong choice is recoverable.",
+    schema: RepairDraftsSchema,
+    scopes: ["gmail.modify"],
+    annotations: { title: "Repair Stranded Drafts", destructiveHint: false, idempotentHint: true },
   },
   {
     name: "delete_email",
@@ -467,6 +542,36 @@ export const toolDefinitions: ToolDefinition[] = [
     schema: ReplyAllSchema,
     scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
     annotations: { title: "Reply All", destructiveHint: false },
+  },
+
+  // Mailbox settings
+  {
+    name: "get_settings",
+    description: "Reads the account's mailbox settings in one call: send-as addresses (with their signatures), vacation responder, auto-forwarding, forwarding addresses, delegates, IMAP, POP and display language. Each section reports its own state, so a section this account is not permitted to read is reported as unreadable rather than as empty or off. Use this to answer \"what is my mailbox configured to do\" and to check whether anything is forwarding or delegating mail.",
+    schema: GetSettingsSchema,
+    scopes: ["gmail.readonly", "gmail.modify", "gmail.settings.basic"],
+    annotations: { title: "Get Mailbox Settings", readOnlyHint: true },
+  },
+  {
+    name: "set_signature",
+    description: "Sets the Gmail signature on a send-as address. The signature is Markdown and is rendered to HTML before saving. Note this is the signature Gmail appends when composing in the Gmail web UI; it is not added to mail sent through this server's send_email tool. Gmail sanitizes signature HTML, and the tool reports when what Gmail stored differs from what was sent.",
+    schema: SetSignatureSchema,
+    scopes: ["gmail.settings.basic", "gmail.settings.sharing"],
+    annotations: { title: "Set Signature", destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "update_send_as",
+    description: "Updates the identity fields of a send-as address: display name, Reply-To address, alias handling, and which address is the default From. Use set_signature for the signature. Only the fields provided are changed.",
+    schema: UpdateSendAsSchema,
+    scopes: ["gmail.settings.basic", "gmail.settings.sharing"],
+    annotations: { title: "Update Send-As Address", destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "set_vacation_responder",
+    description: "Turns the vacation responder (out-of-office auto-reply) on or off, with an optional subject, Markdown body, and start/end dates. Current settings are read and merged, so fields that are not provided keep their existing values.",
+    schema: SetVacationResponderSchema,
+    scopes: ["gmail.settings.basic"],
+    annotations: { title: "Set Vacation Responder", destructiveHint: false, idempotentHint: true },
   },
 ];
 
