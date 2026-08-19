@@ -385,6 +385,9 @@ The server automatically filters available tools based on your authorized scopes
 | `modify_email`, `delete_email`, `batch_modify_emails`, `batch_delete_emails`, `modify_thread`, `report_phishing`, `batch_report_phishing` | `gmail.modify` |
 | `create_label`, `update_label`, `delete_label`, `get_or_create_label` | `gmail.modify` or `gmail.labels` |
 | `list_filters`, `get_filter`, `create_filter`, `delete_filter`, `create_filter_from_template` | `gmail.settings.basic` |
+| `get_settings` | `gmail.readonly`, `gmail.modify`, or `gmail.settings.basic` |
+| `set_signature`, `update_send_as` | `gmail.settings.basic` or `gmail.settings.sharing` |
+| `set_vacation_responder` | `gmail.settings.basic` |
 
 ### Re-authenticating
 
@@ -840,6 +843,94 @@ send_draft(draftId)          // atomic send + draft removal
 ```
 
 Or abort: `delete_draft(draftId)`.
+
+### 27. Get Mailbox Settings (`get_settings`)
+
+Reads the whole `users.settings` surface in one call: send-as addresses and their signatures, vacation responder, auto-forwarding, forwarding addresses, delegates, IMAP, POP and display language.
+
+```json
+{}
+```
+
+**Each section reports its own state.** Some settings are only readable by domain-wide-delegated service accounts (`delegates.list` is documented that way), so under normal per-user OAuth that section is refused. When a read fails the section says so:
+
+```
+## Delegates
+Could not read this section: not permitted (403): Delegation is not supported for this account.
+```
+
+It never prints `None configured.` for a section it could not read. "No delegates" and "not allowed to ask about delegates" are different answers, and only one of them is safe to act on. `None configured.` appears only when the read actually succeeded and came back empty.
+
+This makes the tool usable as a quick exfiltration check: auto-forwarding and forwarding addresses are readable with ordinary scopes, so you can see whether anything is siphoning mail out of the account.
+
+### 28. Set Signature (`set_signature`)
+
+Sets the Gmail signature on a send-as address. The signature is **Markdown**, rendered to HTML before saving, consistent with how message bodies work.
+
+```json
+{
+  "signature": "**Jason Waldrip**\nCTO\n[imacto.com](https://imacto.com)"
+}
+```
+
+Targets the account's default From address unless `sendAsEmail` names another. Pass `signatureHtml` instead to save hand-authored HTML verbatim, or `"signature": ""` to clear it.
+
+> **This is the web-UI signature.** Gmail documents `signature` as the signature added when composing **in the Gmail web interface**. It is *not* appended to mail sent through this server's `send_email` / `reply_all` tools. To sign an API-sent message, put the signature in the body.
+
+Gmail sanitizes signature HTML server-side. The tool reads back what Gmail stored and tells you when it differs from what was sent.
+
+### 29. Update Send-As Address (`update_send_as`)
+
+Updates the identity fields of a send-as address. Uses `sendAs.patch`, so fields you do not pass are left alone.
+
+```json
+{
+  "displayName": "Jason Waldrip",
+  "replyToAddress": "jason@example.com"
+}
+```
+
+| Field | Notes |
+| --- | --- |
+| `displayName` | Name in the From header. Empty string clears it. |
+| `replyToAddress` | Adds a Reply-To header. Empty string removes it. |
+| `treatAsAlias` | Custom From addresses only. |
+| `makeDefault` | Only `true` is accepted: an account always has exactly one default, changed by promoting another address. |
+
+Gmail documents that a `displayName` update on the primary address **silently fails** when an admin has disabled name changes: the request succeeds and nothing changes. This tool compares the response against what it asked for and reports any field Gmail accepted but ignored, rather than claiming success.
+
+Use `set_signature` for the signature; this tool does not touch it.
+
+### 30. Set Vacation Responder (`set_vacation_responder`)
+
+Turns the out-of-office auto-reply on or off.
+
+```json
+{
+  "enabled": true,
+  "subject": "Out of office",
+  "body": "I'm away until **Monday**. For anything urgent, contact the team.",
+  "startTime": "2026-08-20",
+  "endTime": "2026-08-27T17:00:00-07:00"
+}
+```
+
+- `body` is Markdown, rendered to HTML. `bodyHtml` saves HTML verbatim.
+- `startTime` / `endTime` accept an ISO date or datetime. **A bare date means UTC midnight**, so pass an offset when the exact local hour matters. Both are optional; with neither, the responder runs until turned off.
+- `restrictToContacts` limits replies to your contacts; `restrictToDomain` limits them to your own domain (Workspace only).
+
+`updateVacation` replaces the entire resource, so this tool reads the current settings and merges your fields over them. Changing only the subject keeps the existing body, and `{"enabled": false}` turns the responder off without discarding the stored message.
+
+Gmail requires a nonempty subject or body to enable the responder. That is checked against the merged result, so enabling against a body you set earlier works without repeating it.
+
+### Settings this server deliberately does not write
+
+| Setting | Why not |
+| --- | --- |
+| Auto-forwarding | `updateAutoForwarding` is documented as "only available to service account clients that have been delegated domain-wide authority". Under this server's per-user OAuth it cannot succeed, so there is no tool for it. Reading it works and is included in `get_settings`. |
+| Delegates, forwarding-address creation | Same domain-wide-delegation restriction. |
+| Send-as alias create / delete / verify | Require `gmail.settings.sharing` plus domain-wide delegation for addresses other than the primary. |
+| IMAP, POP, display language | Readable via `get_settings`. These are one-time client-setup toggles; an agent changing them on your behalf is almost always wrong, so they are read-only here. |
 
 ## Filter Management Features
 

@@ -207,6 +207,34 @@ export const ReplyAllSchema = z.object({
 
 export const ListSendAsSchema = z.object({});
 
+// Mailbox settings schemas (users.settings.*)
+export const GetSettingsSchema = z.object({});
+
+export const SetSignatureSchema = z.object({
+  signature: z.string().optional().describe("Signature in Markdown, rendered to HTML before saving. Pass an empty string to clear the signature."),
+  signatureHtml: z.string().optional().describe("Explicit HTML signature, saved verbatim. Overrides the HTML rendered from the Markdown signature; only needed for hand-authored HTML."),
+  sendAsEmail: z.string().optional().describe("Which send-as address to change. Defaults to the account's default From address. Use list_send_as to see the options."),
+});
+
+export const UpdateSendAsSchema = z.object({
+  sendAsEmail: z.string().optional().describe("Which send-as address to change. Defaults to the account's default From address. Use list_send_as to see the options."),
+  displayName: z.string().optional().describe("Name shown in the From header. Pass an empty string to clear it. Gmail silently ignores this for the primary address when an admin has disabled name changes; the tool reports when that happens."),
+  replyToAddress: z.string().optional().describe("Address to put in the Reply-To header for mail sent from this alias. Pass an empty string to remove the header."),
+  treatAsAlias: z.boolean().optional().describe("Whether Gmail treats this address as an alias of the primary address. Applies only to custom From addresses."),
+  makeDefault: z.literal(true).optional().describe("Promote this address to the default From address. Only true is accepted: an account always has exactly one default, changed by promoting another address."),
+});
+
+export const SetVacationResponderSchema = z.object({
+  enabled: z.boolean().describe("Turn the vacation responder on or off. Turning it off leaves the stored subject and body in place."),
+  subject: z.string().optional().describe("Subject prefix for auto-replies. Gmail needs a nonempty subject or body to enable the responder."),
+  body: z.string().optional().describe("Auto-reply body in Markdown, rendered to HTML before saving."),
+  bodyHtml: z.string().optional().describe("Explicit HTML auto-reply body, saved verbatim. Overrides the HTML rendered from the Markdown body."),
+  startTime: z.string().optional().describe("When to start auto-replying, as an ISO date (2026-08-20) or datetime (2026-08-20T09:00:00-07:00). A bare date is treated as UTC midnight, so pass an offset if the exact local hour matters."),
+  endTime: z.string().optional().describe("When to stop auto-replying, same format as startTime. Must be after startTime."),
+  restrictToContacts: z.boolean().optional().describe("Only auto-reply to senders in the user's contacts."),
+  restrictToDomain: z.boolean().optional().describe("Only auto-reply to senders inside the user's own domain. Google Workspace accounts only."),
+});
+
 // Tool definition type
 export interface ToolAnnotations {
   title: string;
@@ -467,6 +495,36 @@ export const toolDefinitions: ToolDefinition[] = [
     schema: ReplyAllSchema,
     scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
     annotations: { title: "Reply All", destructiveHint: false },
+  },
+
+  // Mailbox settings
+  {
+    name: "get_settings",
+    description: "Reads the account's mailbox settings in one call: send-as addresses (with their signatures), vacation responder, auto-forwarding, forwarding addresses, delegates, IMAP, POP and display language. Each section reports its own state, so a section this account is not permitted to read is reported as unreadable rather than as empty or off. Use this to answer \"what is my mailbox configured to do\" and to check whether anything is forwarding or delegating mail.",
+    schema: GetSettingsSchema,
+    scopes: ["gmail.readonly", "gmail.modify", "gmail.settings.basic"],
+    annotations: { title: "Get Mailbox Settings", readOnlyHint: true },
+  },
+  {
+    name: "set_signature",
+    description: "Sets the Gmail signature on a send-as address. The signature is Markdown and is rendered to HTML before saving. Note this is the signature Gmail appends when composing in the Gmail web UI; it is not added to mail sent through this server's send_email tool. Gmail sanitizes signature HTML, and the tool reports when what Gmail stored differs from what was sent.",
+    schema: SetSignatureSchema,
+    scopes: ["gmail.settings.basic", "gmail.settings.sharing"],
+    annotations: { title: "Set Signature", destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "update_send_as",
+    description: "Updates the identity fields of a send-as address: display name, Reply-To address, alias handling, and which address is the default From. Use set_signature for the signature. Only the fields provided are changed.",
+    schema: UpdateSendAsSchema,
+    scopes: ["gmail.settings.basic", "gmail.settings.sharing"],
+    annotations: { title: "Update Send-As Address", destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "set_vacation_responder",
+    description: "Turns the vacation responder (out-of-office auto-reply) on or off, with an optional subject, Markdown body, and start/end dates. Current settings are read and merged, so fields that are not provided keep their existing values.",
+    schema: SetVacationResponderSchema,
+    scopes: ["gmail.settings.basic"],
+    annotations: { title: "Set Vacation Responder", destructiveHint: false, idempotentHint: true },
   },
 ];
 
