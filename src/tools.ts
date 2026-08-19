@@ -217,6 +217,15 @@ export const ReplyAllSchema = z.object({
 
 export const ListSendAsSchema = z.object({});
 
+// Draft integrity: messages holding both DRAFT and TRASH, which Gmail hides as
+// deleted while IMAP clients keep listing them in Drafts.
+export const FindStrandedDraftsSchema = z.object({});
+
+export const RepairDraftsSchema = z.object({
+  mode: z.enum(['restore', 'discard']).describe("restore: remove TRASH so the message is a live draft again in both Gmail and IMAP clients. discard: remove DRAFT so it is an ordinary trashed message and stops appearing in IMAP Drafts folders. Neither mode deletes anything."),
+  messageIds: z.array(z.string()).optional().describe("Limit the repair to these message IDs. Omit to repair every stranded draft in the mailbox."),
+});
+
 // Mailbox settings schemas (users.settings.*)
 export const GetSettingsSchema = z.object({});
 
@@ -383,17 +392,31 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "trash_email",
-    description: "Moves an email to Trash (recoverable for 30 days). Prefer this over delete_email — delete_email is a permanent, irreversible delete.",
+    description: "Moves an email to Trash (recoverable for 30 days). Prefer this over delete_email — delete_email is a permanent, irreversible delete. Refuses to trash a draft: that would leave the message holding both DRAFT and TRASH, which hides it from Gmail while IMAP clients such as Apple Mail keep listing it in Drafts. Discard drafts with delete_draft instead.",
     schema: TrashEmailSchema,
     scopes: ["gmail.modify"],
     annotations: { title: "Trash Email", destructiveHint: false, idempotentHint: true },
   },
   {
     name: "batch_trash_emails",
-    description: "Moves multiple emails to Trash (recoverable for 30 days). Prefer this over batch_delete_emails for clearing the inbox.",
+    description: "Moves multiple emails to Trash (recoverable for 30 days). Prefer this over batch_delete_emails for clearing the inbox. If any id in the batch is a draft, nothing is trashed and every offending id is named, because trashing a draft strands it as visible in IMAP clients but deleted in Gmail.",
     schema: BatchTrashEmailsSchema,
     scopes: ["gmail.modify"],
     annotations: { title: "Batch Trash Emails", destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "find_stranded_drafts",
+    description: "Finds messages holding both the DRAFT and TRASH labels. Gmail hides these as \"N deleted messages in this conversation\" while IMAP clients such as Apple Mail keep listing them in the Drafts folder, so the same message looks deleted in one client and editable in another. Use repair_drafts to resolve them.",
+    schema: FindStrandedDraftsSchema,
+    scopes: ["gmail.readonly", "gmail.modify"],
+    annotations: { title: "Find Stranded Drafts", readOnlyHint: true },
+  },
+  {
+    name: "repair_drafts",
+    description: "Resolves messages stuck holding both DRAFT and TRASH into one consistent state. mode \"restore\" removes TRASH so they are live drafts again in Gmail and in IMAP clients; mode \"discard\" removes DRAFT so they are ordinary trashed messages. Neither mode deletes anything, so a wrong choice is recoverable.",
+    schema: RepairDraftsSchema,
+    scopes: ["gmail.modify"],
+    annotations: { title: "Repair Stranded Drafts", destructiveHint: false, idempotentHint: true },
   },
   {
     name: "delete_email",

@@ -57,6 +57,7 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 - **Download full emails** to files in json/eml/txt/html formats
 - **Thread-level operations** — get full threads, list inbox threads, batch-expand threads
 - **Markdown bodies rendered to HTML by default** — every composed message goes out as `multipart/alternative` (rendered HTML plus a plain-text part) unless you opt out with `mimeType`
+- **No more stranded drafts** — trashing a draft is refused (it leaves a message Gmail calls deleted but IMAP clients still list as a draft), and `repair_drafts` cleans up any already in that state
 - **Draft edits cannot clobber your own changes** — revising a draft requires reading it first, the edit is refused if the draft changed since that read, and fields you omit keep their current values
 - Full support for international characters in subject lines and email content
 - Read email messages by ID with advanced MIME structure handling
@@ -385,6 +386,8 @@ The server automatically filters available tools based on your authorized scopes
 | `delete_draft`, `update_draft` | `gmail.modify` or `gmail.compose` |
 | `read_draft`, `list_drafts` | `gmail.readonly`, `gmail.modify`, or `gmail.compose` |
 | `modify_email`, `delete_email`, `batch_modify_emails`, `batch_delete_emails`, `modify_thread`, `report_phishing`, `batch_report_phishing` | `gmail.modify` |
+| `find_stranded_drafts` | `gmail.readonly` or `gmail.modify` |
+| `repair_drafts` | `gmail.modify` |
 | `create_label`, `update_label`, `delete_label`, `get_or_create_label` | `gmail.modify` or `gmail.labels` |
 | `list_filters`, `get_filter`, `create_filter`, `delete_filter`, `create_filter_from_template` | `gmail.settings.basic` |
 | `get_settings` | `gmail.readonly`, `gmail.modify`, or `gmail.settings.basic` |
@@ -924,7 +927,39 @@ send_draft(draftId)                                  // atomic send + draft remo
 
 Or abort: `delete_draft(draftId)`.
 
-### 29. Get Mailbox Settings (`get_settings`)
+### 33. Find Stranded Drafts (`find_stranded_drafts`)
+
+Finds messages holding both the `DRAFT` and `TRASH` labels.
+
+```json
+{}
+```
+
+Gmail labels are not exclusive, so a message can be both a draft and trashed. The two client families then disagree about what it is: **Gmail's web UI honours `TRASH`** and collapses the message into the "N deleted messages in this conversation" affordance, while **IMAP clients (Apple Mail, Outlook, Thunderbird) map labels onto folders**, so `DRAFT` still present means the message keeps showing up in the Drafts folder, indefinitely, as something you can open and try to edit.
+
+This state comes from trashing a draft *message* (adding the `TRASH` label) instead of discarding the *draft* (`delete_draft`). `trash_email` and `batch_trash_emails` now refuse to trash a draft for exactly this reason, so the state should not arise again; this tool finds any that already exist.
+
+### 34. Repair Stranded Drafts (`repair_drafts`)
+
+Resolves DRAFT+TRASH messages into one consistent state, in either direction:
+
+```json
+{
+  "mode": "restore",
+  "messageIds": ["optional", "specific", "ids"]
+}
+```
+
+| Mode | Removes | Result |
+| --- | --- | --- |
+| `restore` | `TRASH` | A live draft again, visible and editable in Gmail **and** IMAP clients |
+| `discard` | `DRAFT` | An ordinary trashed message; IMAP Drafts folders stop listing it; Gmail purges it on its own schedule |
+
+Neither mode deletes anything. The message and its content stay in the mailbox either way, so a wrong choice is recoverable by re-adding the other label with `modify_email`. Omit `messageIds` to repair every stranded draft in the mailbox.
+
+> **Guards at every sink:** `trash_email`, `batch_trash_emails`, `modify_email`, `batch_modify_emails` and `modify_thread` all refuse to add `TRASH` to a draft. Discard drafts with `delete_draft`.
+
+### 35. Get Mailbox Settings (`get_settings`)
 
 Reads the whole `users.settings` surface in one call: send-as addresses and their signatures, vacation responder, auto-forwarding, forwarding addresses, delegates, IMAP, POP and display language.
 
@@ -943,7 +978,7 @@ It never prints `None configured.` for a section it could not read. "No delegate
 
 This makes the tool usable as a quick exfiltration check: auto-forwarding and forwarding addresses are readable with ordinary scopes, so you can see whether anything is siphoning mail out of the account.
 
-### 30. Set Signature (`set_signature`)
+### 36. Set Signature (`set_signature`)
 
 Sets the Gmail signature on a send-as address. The signature is **Markdown**, rendered to HTML before saving, consistent with how message bodies work.
 
@@ -959,7 +994,7 @@ Targets the account's default From address unless `sendAsEmail` names another. P
 
 Gmail sanitizes signature HTML server-side. The tool reads back what Gmail stored and tells you when it differs from what was sent.
 
-### 31. Update Send-As Address (`update_send_as`)
+### 37. Update Send-As Address (`update_send_as`)
 
 Updates the identity fields of a send-as address. Uses `sendAs.patch`, so fields you do not pass are left alone.
 
@@ -981,7 +1016,7 @@ Gmail documents that a `displayName` update on the primary address **silently fa
 
 Use `set_signature` for the signature; this tool does not touch it.
 
-### 32. Set Vacation Responder (`set_vacation_responder`)
+### 38. Set Vacation Responder (`set_vacation_responder`)
 
 Turns the out-of-office auto-reply on or off.
 
