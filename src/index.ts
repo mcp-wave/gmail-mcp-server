@@ -20,10 +20,11 @@ import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, get
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
 import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
-import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ListSendAsSchema, TrashEmailSchema, BatchTrashEmailsSchema } from "./tools.js";
+import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ListSendAsSchema, TrashEmailSchema, BatchTrashEmailsSchema, GetSettingsSchema, SetSignatureSchema, UpdateSendAsSchema, SetVacationResponderSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import type { Account, PrincipalSession, ResolveSession, SendPolicy } from "./session.js";
 import { disallowedRecipients, emailAddressOf, isPublicEmailDomain, rejectedAllowlistEntry, type SendContext } from "./send-policy.js";
+import { readAllSettings, setSignature, updateSendAs, setVacationResponder, formatSettingsSnapshot } from "./settings-manager.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -71,6 +72,9 @@ const WRITE_TOOLS = new Set([
     'create_label', 'update_label',
     'delete_label', 'get_or_create_label', 'create_filter', 'delete_filter',
     'create_filter_from_template', 'reply_all', 'modify_thread',
+    // Mailbox settings writes. get_settings is a read and deliberately absent:
+    // it fans out so a multi-account audit covers every linked mailbox.
+    'set_signature', 'update_send_as', 'set_vacation_responder',
 ]);
 
 const errText = (text: string) => ({ content: [{ type: 'text', text }] });
@@ -1653,6 +1657,66 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                             text: `Send-as addresses (use as the "from" parameter):\n${lines.join('\n')}`,
                         }],
                     };
+                }
+
+                case "get_settings": {
+                    GetSettingsSchema.parse(args);
+                    const snapshot = await readAllSettings(gmail);
+                    return {
+                        content: [{ type: "text", text: formatSettingsSnapshot(snapshot) }],
+                    };
+                }
+
+                case "set_signature": {
+                    const validatedArgs = SetSignatureSchema.parse(args);
+                    const result = await setSignature(gmail, validatedArgs);
+                    const parts = [`Signature updated for ${result.sendAsEmail}.`];
+                    if (result.storedSignature === '') {
+                        parts.push('The signature is now empty.');
+                    } else if (result.alteredByGmail) {
+                        // Gmail sanitizes signature HTML, so say so instead of
+                        // implying the sent markup was stored verbatim.
+                        parts.push(`Gmail sanitized the HTML on save. Stored value:\n${result.storedSignature}`);
+                    }
+                    parts.push('Note: this is the signature Gmail adds when composing in the web UI. It is not appended to mail sent through send_email.');
+                    return { content: [{ type: "text", text: parts.join('\n') }] };
+                }
+
+                case "update_send_as": {
+                    const validatedArgs = UpdateSendAsSchema.parse(args);
+                    const result = await updateSendAs(gmail, validatedArgs);
+                    const changed = Object.entries(result.applied)
+                        .filter(([field]) => !result.ignored.includes(field))
+                        .map(([field, value]) => `${field}: ${JSON.stringify(value)}`);
+                    const parts = [`Updated ${result.sendAsEmail}.`];
+                    parts.push(changed.length > 0 ? `Applied — ${changed.join(', ')}` : 'Applied — nothing.');
+                    if (result.ignored.length > 0) {
+                        // Gmail accepts these requests and does nothing, e.g. a display
+                        // name change when an admin has disabled name changes.
+                        parts.push(
+                            `Gmail accepted the request but did not change: ${result.ignored.join(', ')}. ` +
+                            `For displayName on the primary address this usually means an admin has disabled name changes.`,
+                        );
+                    }
+                    return { content: [{ type: "text", text: parts.join('\n') }] };
+                }
+
+                case "set_vacation_responder": {
+                    const validatedArgs = SetVacationResponderSchema.parse(args);
+                    const result = await setVacationResponder(gmail, validatedArgs);
+                    const window = [
+                        result.startTime ? `from ${new Date(Number(result.startTime)).toISOString()}` : null,
+                        result.endTime ? `until ${new Date(Number(result.endTime)).toISOString()}` : null,
+                    ].filter(Boolean).join(' ');
+                    const parts = [
+                        result.enableAutoReply
+                            ? `Vacation responder is ON${window ? ` ${window}` : ' with no end date'}.`
+                            : 'Vacation responder is OFF.',
+                    ];
+                    if (result.responseSubject) parts.push(`Subject: ${result.responseSubject}`);
+                    if (result.restrictToContacts) parts.push('Replies limited to contacts.');
+                    if (result.restrictToDomain) parts.push('Replies limited to your domain.');
+                    return { content: [{ type: "text", text: parts.join('\n') }] };
                 }
 
                 case "delete_filter": {
