@@ -20,11 +20,12 @@ import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, get
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
 import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
-import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ListSendAsSchema, TrashEmailSchema, BatchTrashEmailsSchema, GetSettingsSchema, SetSignatureSchema, UpdateSendAsSchema, SetVacationResponderSchema } from "./tools.js";
+import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ReadDraftSchema, ListDraftsSchema, ListSendAsSchema, TrashEmailSchema, BatchTrashEmailsSchema, GetSettingsSchema, SetSignatureSchema, UpdateSendAsSchema, SetVacationResponderSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import type { Account, PrincipalSession, ResolveSession, SendPolicy } from "./session.js";
 import { disallowedRecipients, emailAddressOf, isPublicEmailDomain, rejectedAllowlistEntry, type SendContext } from "./send-policy.js";
 import { readAllSettings, setSignature, updateSendAs, setVacationResponder, formatSettingsSnapshot } from "./settings-manager.js";
+import { buildDraftSnapshot, mergeDraftEdit, assertFresh, assertAttachmentsSafe, describeMerge, draftToken, StaleDraftError, type DraftSnapshot } from "./draft-manager.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -435,6 +436,51 @@ function extractAttachments(payload: GmailMessagePart): EmailAttachment[] {
 
     processAttachmentParts(payload);
     return attachments;
+}
+
+/**
+ * Read a draft and reduce it to the snapshot the edit guard compares against.
+ *
+ * Uses the existing payload extractors so draft parsing cannot drift from how
+ * read_email and download_email interpret the same MIME structures.
+ */
+async function loadDraftSnapshot(gmail: any, draftId: string) {
+    const response = await gmail.users.drafts.get({
+        userId: 'me',
+        id: draftId,
+        format: 'full',
+    });
+    const payload = response.data.message?.payload;
+    return buildDraftSnapshot({
+        draft: response.data,
+        headers: extractHeaders(payload),
+        content: payload ? extractEmailContent(payload) : { text: '', html: '' },
+        attachments: payload
+            ? extractAttachments(payload).map(a => ({
+                filename: a.filename,
+                mimeType: a.mimeType,
+                size: a.size,
+            }))
+            : [],
+    });
+}
+
+/** Render a draft snapshot, including the token an edit must quote back. */
+function formatDraftSnapshot(snapshot: DraftSnapshot): string {
+    const lines = [
+        `Draft ${snapshot.draftId}`,
+        `baseToken: ${snapshot.token}`,
+        `To: ${snapshot.to.join(', ') || '(none)'}`,
+    ];
+    if (snapshot.cc.length > 0) lines.push(`Cc: ${snapshot.cc.join(', ')}`);
+    if (snapshot.bcc.length > 0) lines.push(`Bcc: ${snapshot.bcc.join(', ')}`);
+    lines.push(`Subject: ${snapshot.subject || '(none)'}`);
+    if (snapshot.attachments.length > 0) {
+        lines.push(`Attachments: ${snapshot.attachments.map(a => `${a.filename} (${a.mimeType}, ${Math.round(a.size / 1024)} KB)`).join(', ')}`);
+    }
+    lines.push('', '--- body (text) ---', snapshot.text || '(empty)');
+    if (snapshot.html) lines.push('', '--- body (html) ---', snapshot.html);
+    return lines.join('\n');
 }
 
 async function loadCredentials() {
@@ -1242,13 +1288,77 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                     };
                 }
 
+                case "read_draft": {
+                    const validatedArgs = ReadDraftSchema.parse(args);
+                    const snapshot = await loadDraftSnapshot(gmail, validatedArgs.draftId);
+                    return { content: [{ type: "text", text: formatDraftSnapshot(snapshot) }] };
+                }
+
+                case "list_drafts": {
+                    const validatedArgs = ListDraftsSchema.parse(args);
+                    const listed = await gmail.users.drafts.list({
+                        userId: 'me',
+                        maxResults: validatedArgs.maxResults || 25,
+                    });
+                    const drafts = listed.data.drafts || [];
+                    if (drafts.length === 0) {
+                        return { content: [{ type: "text", text: "No drafts." }] };
+                    }
+
+                    // drafts.list returns ids only, so fetch metadata per draft to
+                    // make them identifiable by content rather than by id alone.
+                    const rows = await Promise.all(drafts.map(async (d: any) => {
+                        try {
+                            const full = await gmail.users.drafts.get({
+                                userId: 'me',
+                                id: d.id,
+                                format: 'metadata',
+                            });
+                            const headers = extractHeaders(full.data.message?.payload);
+                            const snippet = full.data.message?.snippet || '';
+                            return `- ${d.id}: to ${headers.to || '(no recipients)'} — ${headers.subject || '(no subject)'}${snippet ? `\n    ${snippet}` : ''}`;
+                        } catch (error: any) {
+                            // Report the draft we could not read, rather than dropping
+                            // it and implying the mailbox holds fewer drafts.
+                            return `- ${d.id}: could not read (${error?.message || 'unknown error'})`;
+                        }
+                    }));
+
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Drafts (${drafts.length}). Use read_draft for full content and a baseToken:\n${rows.join('\n')}`,
+                        }],
+                    };
+                }
+
                 case "update_draft": {
                     const validatedArgs = UpdateDraftSchema.parse(args);
-                    const { draftId, ...messageArgs } = validatedArgs;
+                    const { draftId, baseToken, dropAttachments, ...editArgs } = validatedArgs;
+
+                    // Read the live draft first. The user may have edited it in Gmail
+                    // since the agent last saw it, and drafts.update replaces the whole
+                    // message, so building an edit without the current content destroys
+                    // whatever they wrote.
+                    const current = await loadDraftSnapshot(gmail, draftId);
+
+                    try {
+                        assertFresh(current, baseToken);
+                        assertAttachmentsSafe(current, { ...editArgs, dropAttachments });
+                    } catch (error: any) {
+                        if (error instanceof StaleDraftError) {
+                            return errText(`${error.message}\n\n${formatDraftSnapshot(error.currentSnapshot)}`);
+                        }
+                        return errText(`Error: ${error.message}`);
+                    }
+
+                    const merged = mergeDraftEdit(current, { ...editArgs, dropAttachments });
+                    const messageArgs = merged.messageArgs;
 
                     // Build the new MIME message using the same helpers as draft_email/send_email
                     let message: string;
-                    if (messageArgs.attachments && messageArgs.attachments.length > 0) {
+                    const attachmentPaths = messageArgs.attachments as string[] | undefined;
+                    if (attachmentPaths && attachmentPaths.length > 0) {
                         message = await createEmailWithNodemailer(messageArgs);
                     } else {
                         message = createEmailMessage(messageArgs);
@@ -1268,11 +1378,19 @@ function createMcpServer(resolveSession: ResolveSession): Server {
                         requestBody: { message: messageRequest },
                     });
 
+                    // Hand back the new token so a follow-up edit does not need a
+                    // second read_draft round trip.
+                    const newToken = draftToken(
+                        response.data.message?.id,
+                        response.data.message?.historyId,
+                    );
+
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: `Draft ${draftId} updated successfully (draft ID unchanged, content replaced).`,
+                                text: `Draft ${draftId} updated (ID unchanged). Changes: ${describeMerge(merged)}.\n` +
+                                    `New baseToken for further edits: ${newToken}`,
                             },
                         ],
                     };
