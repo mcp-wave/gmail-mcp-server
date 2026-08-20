@@ -45,56 +45,56 @@ export type LanguageSettings = gmail_v1.Schema$LanguageSettings;
  * a caller cannot mistake a denied read for a configured-off setting.
  */
 export type SectionResult<T> =
-    | { status: 'ok'; value: T }
-    | { status: 'failed'; reason: string };
+ | { status: 'ok'; value: T }
+ | { status: 'failed'; reason: string };
 
 export interface SettingsSnapshot {
-    sendAs: SectionResult<SendAsAlias[]>;
-    vacation: SectionResult<VacationSettings>;
-    autoForwarding: SectionResult<AutoForwarding>;
-    forwardingAddresses: SectionResult<ForwardingAddress[]>;
-    delegates: SectionResult<Delegate[]>;
-    imap: SectionResult<ImapSettings>;
-    pop: SectionResult<PopSettings>;
-    language: SectionResult<LanguageSettings>;
+ sendAs: SectionResult<SendAsAlias[]>;
+ vacation: SectionResult<VacationSettings>;
+ autoForwarding: SectionResult<AutoForwarding>;
+ forwardingAddresses: SectionResult<ForwardingAddress[]>;
+ delegates: SectionResult<Delegate[]>;
+ imap: SectionResult<ImapSettings>;
+ pop: SectionResult<PopSettings>;
+ language: SectionResult<LanguageSettings>;
 }
 
 /** Read `code`/`status` and a message off an unknown thrown value. */
 function describeError(error: unknown): { status?: number; message: string } {
-    if (!error || typeof error !== 'object') {
-        return { message: String(error ?? 'unknown error') };
-    }
-    let status: number | undefined;
-    if ('code' in error && typeof error.code === 'number') status = error.code;
-    else if ('status' in error && typeof error.status === 'number') status = error.status;
+ if (!error || typeof error !== 'object') {
+  return { message: String(error ?? 'unknown error') };
+ }
+ let status: number | undefined;
+ if ('code' in error && typeof error.code === 'number') status = error.code;
+ else if ('status' in error && typeof error.status === 'number') status = error.status;
 
-    let message: string | undefined;
-    if ('errors' in error && Array.isArray(error.errors)) {
-        const first: unknown = error.errors[0];
-        if (first && typeof first === 'object' && 'message' in first && typeof first.message === 'string') {
-            message = first.message;
-        }
-    }
-    if (!message && 'message' in error && typeof error.message === 'string') message = error.message;
+ let message: string | undefined;
+ if ('errors' in error && Array.isArray(error.errors)) {
+  const first: unknown = error.errors[0];
+  if (first && typeof first === 'object' && 'message' in first && typeof first.message === 'string') {
+   message = first.message;
+  }
+ }
+ if (!message && 'message' in error && typeof error.message === 'string') message = error.message;
 
-    return { status, message: message || 'unknown error' };
+ return { status, message: message || 'unknown error' };
 }
 
 /** Human-readable reason for a failed API read, preferring Google's own message. */
 export function failureReason(error: unknown): string {
-    const { status, message } = describeError(error);
-    if (status === 403) return `not permitted (403): ${message}`;
-    if (status === 401) return `not authenticated (401): ${message}`;
-    return status ? `error ${status}: ${message}` : `error: ${message}`;
+ const { status, message } = describeError(error);
+ if (status === 403) return `not permitted (403): ${message}`;
+ if (status === 401) return `not authenticated (401): ${message}`;
+ return status ? `error ${status}: ${message}` : `error: ${message}`;
 }
 
 /** Run one section read, capturing failure rather than letting it become an absent value. */
 async function section<T>(read: () => Promise<T>): Promise<SectionResult<T>> {
-    try {
-        return { status: 'ok', value: await read() };
-    } catch (error: unknown) {
-        return { status: 'failed', reason: failureReason(error) };
-    }
+ try {
+  return { status: 'ok', value: await read() };
+ } catch (error: unknown) {
+  return { status: 'failed', reason: failureReason(error) };
+ }
 }
 
 /**
@@ -105,66 +105,66 @@ async function section<T>(read: () => Promise<T>): Promise<SectionResult<T>> {
  * believe forwarding is off.
  */
 export async function readAllSettings(gmail: GmailClient): Promise<SettingsSnapshot> {
-    const [
-        sendAs,
-        vacation,
-        autoForwarding,
-        forwardingAddresses,
-        delegates,
-        imap,
-        pop,
-        language,
-    ] = await Promise.all([
-        section(async () => {
-            const r = await gmail.users.settings.sendAs.list({ userId: 'me' });
-            return r.data.sendAs ?? [];
-        }),
-        section(async () => {
-            const r = await gmail.users.settings.getVacation({ userId: 'me' });
-            return r.data ?? {};
-        }),
-        section(async () => {
-            const r = await gmail.users.settings.getAutoForwarding({ userId: 'me' });
-            return r.data ?? {};
-        }),
-        section(async () => {
-            const r = await gmail.users.settings.forwardingAddresses.list({ userId: 'me' });
-            return r.data.forwardingAddresses ?? [];
-        }),
-        section(async () => {
-            const r = await gmail.users.settings.delegates.list({ userId: 'me' });
-            return r.data.delegates ?? [];
-        }),
-        section(async () => {
-            const r = await gmail.users.settings.getImap({ userId: 'me' });
-            return r.data ?? {};
-        }),
-        section(async () => {
-            const r = await gmail.users.settings.getPop({ userId: 'me' });
-            return r.data ?? {};
-        }),
-        section(async () => {
-            const r = await gmail.users.settings.getLanguage({ userId: 'me' });
-            return r.data ?? {};
-        }),
-    ]);
+ const [
+  sendAs,
+  vacation,
+  autoForwarding,
+  forwardingAddresses,
+  delegates,
+  imap,
+  pop,
+  language,
+ ] = await Promise.all([
+  section(async () => {
+   const r = await gmail.users.settings.sendAs.list({ userId: 'me' });
+   return r.data.sendAs ?? [];
+  }),
+  section(async () => {
+   const r = await gmail.users.settings.getVacation({ userId: 'me' });
+   return r.data ?? {};
+  }),
+  section(async () => {
+   const r = await gmail.users.settings.getAutoForwarding({ userId: 'me' });
+   return r.data ?? {};
+  }),
+  section(async () => {
+   const r = await gmail.users.settings.forwardingAddresses.list({ userId: 'me' });
+   return r.data.forwardingAddresses ?? [];
+  }),
+  section(async () => {
+   const r = await gmail.users.settings.delegates.list({ userId: 'me' });
+   return r.data.delegates ?? [];
+  }),
+  section(async () => {
+   const r = await gmail.users.settings.getImap({ userId: 'me' });
+   return r.data ?? {};
+  }),
+  section(async () => {
+   const r = await gmail.users.settings.getPop({ userId: 'me' });
+   return r.data ?? {};
+  }),
+  section(async () => {
+   const r = await gmail.users.settings.getLanguage({ userId: 'me' });
+   return r.data ?? {};
+  }),
+ ]);
 
-    return { sendAs, vacation, autoForwarding, forwardingAddresses, delegates, imap, pop, language };
+ return { sendAs, vacation, autoForwarding, forwardingAddresses, delegates, imap, pop, language };
 }
 
 /** Epoch-millisecond string to a readable UTC timestamp, or a marker if unparseable. */
 function formatEpochMillis(value?: string | null): string {
-    if (!value) return '(none)';
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) return `(unrecognized: ${value})`;
-    return new Date(parsed).toISOString();
+ if (!value) return '(none)';
+ const parsed = Number(value);
+ if (!Number.isFinite(parsed)) return `(unrecognized: ${value})`;
+ return new Date(parsed).toISOString();
 }
 
 /** Strip HTML tags for a compact one-line preview of a stored HTML value. */
 function preview(html: string, limit = 120): string {
-    const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-    if (text.length <= limit) return text;
-    return `${text.slice(0, limit)}...`;
+ const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+ if (text.length <= limit) return text;
+ return `${text.slice(0, limit)}...`;
 }
 
 /**
@@ -175,110 +175,120 @@ function preview(html: string, limit = 120): string {
  * read actually succeeded and returned none.
  */
 export function formatSettingsSnapshot(snapshot: SettingsSnapshot): string {
-    const lines: string[] = [];
+ const lines: string[] = [];
 
-    const unreadable = (reason: string) => lines.push(`Could not read this section: ${reason}`);
+ const unreadable = (reason: string) => lines.push(`Could not read this section: ${reason}`);
 
-    lines.push('', '## Send-as addresses');
-    if (snapshot.sendAs.status === 'failed') {
-        unreadable(snapshot.sendAs.reason);
-    } else if (snapshot.sendAs.value.length === 0) {
-        lines.push('None configured.');
-    } else {
-        for (const alias of snapshot.sendAs.value) {
-            const tags = [
-                alias.isPrimary ? 'primary' : null,
-                alias.isDefault ? 'default' : null,
-                alias.treatAsAlias ? 'treated as alias' : null,
-                alias.verificationStatus && alias.verificationStatus !== 'accepted'
-                    ? `verification: ${alias.verificationStatus}`
-                    : null,
-            ].filter(Boolean).join(', ');
-            lines.push(`- ${alias.sendAsEmail}${tags ? ` (${tags})` : ''}`);
-            if (alias.displayName) lines.push(`    display name: ${alias.displayName}`);
-            if (alias.replyToAddress) lines.push(`    reply-to: ${alias.replyToAddress}`);
-            lines.push(alias.signature
-                ? `    signature: ${preview(alias.signature)}`
-                : '    signature: (none)');
-        }
+ lines.push('', '## Send-as addresses');
+ if (snapshot.sendAs.status === 'failed') {
+  unreadable(snapshot.sendAs.reason);
+ } else if (snapshot.sendAs.value.length === 0) {
+  lines.push('None configured.');
+ } else {
+  for (const alias of snapshot.sendAs.value) {
+   const tags = [
+    alias.isPrimary ? 'primary' : null,
+    alias.isDefault ? 'default' : null,
+    alias.treatAsAlias ? 'treated as alias' : null,
+    alias.verificationStatus && alias.verificationStatus !== 'accepted'
+     ? `verification: ${alias.verificationStatus}`
+     : null,
+   ].filter(Boolean).join(', ');
+   lines.push(`- ${alias.sendAsEmail}${tags ? ` (${tags})` : ''}`);
+   if (alias.displayName) lines.push(`    display name: ${alias.displayName}`);
+   if (alias.replyToAddress) lines.push(`    reply-to: ${alias.replyToAddress}`);
+   if (!alias.signature) {
+    lines.push('    signature: (none)');
+   } else {
+    // A truncated signature is useless to a caller about to replace it:
+    // set_signature overwrites, so anything not shown here is content
+    // the caller would destroy without ever seeing it. The one-line
+    // preview stays for skimming; the full markup follows verbatim.
+    lines.push(`    signature: ${preview(alias.signature)}`);
+    lines.push('    signature html:');
+    for (const line of alias.signature.split('\n')) {
+     lines.push(`      ${line}`);
     }
+   }
+  }
+ }
 
-    lines.push('', '## Vacation responder');
-    if (snapshot.vacation.status === 'failed') {
-        unreadable(snapshot.vacation.reason);
-    } else {
-        const v = snapshot.vacation.value;
-        lines.push(`enabled: ${v.enableAutoReply ? 'yes' : 'no'}`);
-        lines.push(`subject: ${v.responseSubject || '(none)'}`);
-        const body = v.responseBodyHtml || v.responseBodyPlainText || '';
-        lines.push(`body: ${body ? preview(body) : '(none)'}`);
-        lines.push(`start: ${formatEpochMillis(v.startTime)}`);
-        lines.push(`end: ${formatEpochMillis(v.endTime)}`);
-        lines.push(`restricted to contacts: ${v.restrictToContacts ? 'yes' : 'no'}`);
-        lines.push(`restricted to domain: ${v.restrictToDomain ? 'yes' : 'no'}`);
-    }
+ lines.push('', '## Vacation responder');
+ if (snapshot.vacation.status === 'failed') {
+  unreadable(snapshot.vacation.reason);
+ } else {
+  const v = snapshot.vacation.value;
+  lines.push(`enabled: ${v.enableAutoReply ? 'yes' : 'no'}`);
+  lines.push(`subject: ${v.responseSubject || '(none)'}`);
+  const body = v.responseBodyHtml || v.responseBodyPlainText || '';
+  lines.push(`body: ${body ? preview(body) : '(none)'}`);
+  lines.push(`start: ${formatEpochMillis(v.startTime)}`);
+  lines.push(`end: ${formatEpochMillis(v.endTime)}`);
+  lines.push(`restricted to contacts: ${v.restrictToContacts ? 'yes' : 'no'}`);
+  lines.push(`restricted to domain: ${v.restrictToDomain ? 'yes' : 'no'}`);
+ }
 
-    lines.push('', '## Auto-forwarding');
-    if (snapshot.autoForwarding.status === 'failed') {
-        unreadable(snapshot.autoForwarding.reason);
-    } else {
-        const f = snapshot.autoForwarding.value;
-        lines.push(`enabled: ${f.enabled ? 'yes' : 'no'}`);
-        if (f.enabled) {
-            lines.push(`forwarding to: ${f.emailAddress || '(not reported)'}`);
-            lines.push(`disposition: ${f.disposition || '(not reported)'}`);
-        }
-    }
+ lines.push('', '## Auto-forwarding');
+ if (snapshot.autoForwarding.status === 'failed') {
+  unreadable(snapshot.autoForwarding.reason);
+ } else {
+  const f = snapshot.autoForwarding.value;
+  lines.push(`enabled: ${f.enabled ? 'yes' : 'no'}`);
+  if (f.enabled) {
+   lines.push(`forwarding to: ${f.emailAddress || '(not reported)'}`);
+   lines.push(`disposition: ${f.disposition || '(not reported)'}`);
+  }
+ }
 
-    lines.push('', '## Forwarding addresses');
-    if (snapshot.forwardingAddresses.status === 'failed') {
-        unreadable(snapshot.forwardingAddresses.reason);
-    } else if (snapshot.forwardingAddresses.value.length === 0) {
-        lines.push('None configured.');
-    } else {
-        for (const a of snapshot.forwardingAddresses.value) {
-            lines.push(`- ${a.forwardingEmail} (${a.verificationStatus || 'status not reported'})`);
-        }
-    }
+ lines.push('', '## Forwarding addresses');
+ if (snapshot.forwardingAddresses.status === 'failed') {
+  unreadable(snapshot.forwardingAddresses.reason);
+ } else if (snapshot.forwardingAddresses.value.length === 0) {
+  lines.push('None configured.');
+ } else {
+  for (const a of snapshot.forwardingAddresses.value) {
+   lines.push(`- ${a.forwardingEmail} (${a.verificationStatus || 'status not reported'})`);
+  }
+ }
 
-    lines.push('', '## Delegates');
-    if (snapshot.delegates.status === 'failed') {
-        unreadable(snapshot.delegates.reason);
-    } else if (snapshot.delegates.value.length === 0) {
-        lines.push('None configured.');
-    } else {
-        for (const d of snapshot.delegates.value) {
-            lines.push(`- ${d.delegateEmail} (${d.verificationStatus || 'status not reported'})`);
-        }
-    }
+ lines.push('', '## Delegates');
+ if (snapshot.delegates.status === 'failed') {
+  unreadable(snapshot.delegates.reason);
+ } else if (snapshot.delegates.value.length === 0) {
+  lines.push('None configured.');
+ } else {
+  for (const d of snapshot.delegates.value) {
+   lines.push(`- ${d.delegateEmail} (${d.verificationStatus || 'status not reported'})`);
+  }
+ }
 
-    lines.push('', '## IMAP');
-    if (snapshot.imap.status === 'failed') {
-        unreadable(snapshot.imap.reason);
-    } else {
-        const i = snapshot.imap.value;
-        lines.push(`enabled: ${i.enabled ? 'yes' : 'no'}`);
-        if (i.expungeBehavior) lines.push(`expunge behavior: ${i.expungeBehavior}`);
-        if (i.maxFolderSize) lines.push(`max folder size: ${i.maxFolderSize}`);
-    }
+ lines.push('', '## IMAP');
+ if (snapshot.imap.status === 'failed') {
+  unreadable(snapshot.imap.reason);
+ } else {
+  const i = snapshot.imap.value;
+  lines.push(`enabled: ${i.enabled ? 'yes' : 'no'}`);
+  if (i.expungeBehavior) lines.push(`expunge behavior: ${i.expungeBehavior}`);
+  if (i.maxFolderSize) lines.push(`max folder size: ${i.maxFolderSize}`);
+ }
 
-    lines.push('', '## POP');
-    if (snapshot.pop.status === 'failed') {
-        unreadable(snapshot.pop.reason);
-    } else {
-        const p = snapshot.pop.value;
-        lines.push(`access window: ${p.accessWindow || '(none)'}`);
-        lines.push(`disposition: ${p.disposition || '(none)'}`);
-    }
+ lines.push('', '## POP');
+ if (snapshot.pop.status === 'failed') {
+  unreadable(snapshot.pop.reason);
+ } else {
+  const p = snapshot.pop.value;
+  lines.push(`access window: ${p.accessWindow || '(none)'}`);
+  lines.push(`disposition: ${p.disposition || '(none)'}`);
+ }
 
-    lines.push('', '## Display language');
-    if (snapshot.language.status === 'failed') {
-        unreadable(snapshot.language.reason);
-    } else {
-        lines.push(snapshot.language.value.displayLanguage || '(not set)');
-    }
+ lines.push('', '## Display language');
+ if (snapshot.language.status === 'failed') {
+  unreadable(snapshot.language.reason);
+ } else {
+  lines.push(snapshot.language.value.displayLanguage || '(not set)');
+ }
 
-    return `Mailbox settings${lines.join('\n')}`;
+ return `Mailbox settings${lines.join('\n')}`;
 }
 
 /**
@@ -289,46 +299,46 @@ export function formatSettingsSnapshot(snapshot: SettingsSnapshot): string {
  * "From:" address is used, falling back to the primary login address.
  */
 export async function resolveSendAsAddress(gmail: GmailClient, requested?: string): Promise<string> {
-    const response = await gmail.users.settings.sendAs.list({ userId: 'me' });
-    const aliases = response.data.sendAs ?? [];
-    if (aliases.length === 0) {
-        throw new Error('This account has no send-as addresses.');
-    }
+ const response = await gmail.users.settings.sendAs.list({ userId: 'me' });
+ const aliases = response.data.sendAs ?? [];
+ if (aliases.length === 0) {
+  throw new Error('This account has no send-as addresses.');
+ }
 
-    if (requested) {
-        const wanted = requested.trim().toLowerCase();
-        const match = aliases.find(a => (a.sendAsEmail ?? '').toLowerCase() === wanted);
-        if (!match?.sendAsEmail) {
-            const known = aliases.map(a => a.sendAsEmail).filter(Boolean).join(', ');
-            throw new Error(`"${requested}" is not a send-as address on this account. Available: ${known}`);
-        }
-        return match.sendAsEmail;
-    }
+ if (requested) {
+  const wanted = requested.trim().toLowerCase();
+  const match = aliases.find(a => (a.sendAsEmail ?? '').toLowerCase() === wanted);
+  if (!match?.sendAsEmail) {
+   const known = aliases.map(a => a.sendAsEmail).filter(Boolean).join(', ');
+   throw new Error(`"${requested}" is not a send-as address on this account. Available: ${known}`);
+  }
+  return match.sendAsEmail;
+ }
 
-    const chosen = aliases.find(a => a.isDefault) ?? aliases.find(a => a.isPrimary) ?? aliases[0];
-    if (!chosen.sendAsEmail) {
-        throw new Error('Could not determine a send-as address for this account.');
-    }
-    return chosen.sendAsEmail;
+ const chosen = aliases.find(a => a.isDefault) ?? aliases.find(a => a.isPrimary) ?? aliases[0];
+ if (!chosen.sendAsEmail) {
+  throw new Error('Could not determine a send-as address for this account.');
+ }
+ return chosen.sendAsEmail;
 }
 
 export interface SetSignatureArgs {
-    /** Signature source in Markdown. Rendered to HTML unless `signatureHtml` is given. */
-    signature?: string;
-    /** Explicit HTML signature, used verbatim. */
-    signatureHtml?: string;
-    /** Which send-as address to change. Defaults to the account's default From address. */
-    sendAsEmail?: string;
+ /** Signature source in Markdown. Rendered to HTML unless `signatureHtml` is given. */
+ signature?: string;
+ /** Explicit HTML signature, used verbatim. */
+ signatureHtml?: string;
+ /** Which send-as address to change. Defaults to the account's default From address. */
+ sendAsEmail?: string;
 }
 
 export interface SetSignatureResult {
-    sendAsEmail: string;
-    /** What we sent to Gmail. */
-    signature: string;
-    /** What Gmail reports storing, after its own HTML sanitization. */
-    storedSignature: string;
-    /** True when Gmail stored something other than what we sent. */
-    alteredByGmail: boolean;
+ sendAsEmail: string;
+ /** What we sent to Gmail. */
+ signature: string;
+ /** What Gmail reports storing, after its own HTML sanitization. */
+ storedSignature: string;
+ /** True when Gmail stored something other than what we sent. */
+ alteredByGmail: boolean;
 }
 
 /**
@@ -339,47 +349,47 @@ export interface SetSignatureResult {
  * back from the response and reported when it differs from what we sent.
  */
 export async function setSignature(gmail: GmailClient, args: SetSignatureArgs): Promise<SetSignatureResult> {
-    if (args.signature === undefined && args.signatureHtml === undefined) {
-        throw new Error('Provide "signature" (Markdown) or "signatureHtml". To clear the signature, pass an empty string.');
-    }
+ if (args.signature === undefined && args.signatureHtml === undefined) {
+  throw new Error('Provide "signature" (Markdown) or "signatureHtml". To clear the signature, pass an empty string.');
+ }
 
-    const html = args.signatureHtml ?? markdownToHtml(args.signature ?? '');
-    const sendAsEmail = await resolveSendAsAddress(gmail, args.sendAsEmail);
+ const html = args.signatureHtml ?? markdownToHtml(args.signature ?? '');
+ const sendAsEmail = await resolveSendAsAddress(gmail, args.sendAsEmail);
 
-    const response = await gmail.users.settings.sendAs.patch({
-        userId: 'me',
-        sendAsEmail,
-        requestBody: { signature: html },
-    });
+ const response = await gmail.users.settings.sendAs.patch({
+  userId: 'me',
+  sendAsEmail,
+  requestBody: { signature: html },
+ });
 
-    const stored = response.data?.signature ?? '';
-    return {
-        sendAsEmail,
-        signature: html,
-        storedSignature: stored,
-        alteredByGmail: stored !== html,
-    };
+ const stored = response.data?.signature ?? '';
+ return {
+  sendAsEmail,
+  signature: html,
+  storedSignature: stored,
+  alteredByGmail: stored !== html,
+ };
 }
 
 export interface UpdateSendAsArgs {
-    sendAsEmail?: string;
-    displayName?: string;
-    replyToAddress?: string;
-    treatAsAlias?: boolean;
-    /** Make this the default "From:" address. Gmail only accepts `true` here. */
-    makeDefault?: boolean;
+ sendAsEmail?: string;
+ displayName?: string;
+ replyToAddress?: string;
+ treatAsAlias?: boolean;
+ /** Make this the default "From:" address. Gmail only accepts `true` here. */
+ makeDefault?: boolean;
 }
 
 export interface UpdateSendAsResult {
-    sendAsEmail: string;
-    applied: Record<string, string | boolean>;
-    /**
-     * Fields Gmail accepted the request for but did not actually change. Gmail
-     * documents that display-name updates "silently fail" when an admin has
-     * disabled name changes, so the result is read back and compared.
-     */
-    ignored: string[];
-    current: SendAsAlias;
+ sendAsEmail: string;
+ applied: Record<string, string | boolean>;
+ /**
+  * Fields Gmail accepted the request for but did not actually change. Gmail
+  * documents that display-name updates "silently fail" when an admin has
+  * disabled name changes, so the result is read back and compared.
+  */
+ ignored: string[];
+ current: SendAsAlias;
 }
 
 /**
@@ -390,32 +400,32 @@ export interface UpdateSendAsResult {
  * as ignored rather than as success.
  */
 export async function updateSendAs(gmail: GmailClient, args: UpdateSendAsArgs): Promise<UpdateSendAsResult> {
-    const requestBody: Record<string, string | boolean> = {};
-    if (args.displayName !== undefined) requestBody.displayName = args.displayName;
-    if (args.replyToAddress !== undefined) requestBody.replyToAddress = args.replyToAddress;
-    if (args.treatAsAlias !== undefined) requestBody.treatAsAlias = args.treatAsAlias;
-    if (args.makeDefault !== undefined) {
-        if (args.makeDefault !== true) {
-            throw new Error('makeDefault only accepts true: Gmail always has exactly one default send-as address, so it is changed by promoting another address.');
-        }
-        requestBody.isDefault = true;
-    }
+ const requestBody: Record<string, string | boolean> = {};
+ if (args.displayName !== undefined) requestBody.displayName = args.displayName;
+ if (args.replyToAddress !== undefined) requestBody.replyToAddress = args.replyToAddress;
+ if (args.treatAsAlias !== undefined) requestBody.treatAsAlias = args.treatAsAlias;
+ if (args.makeDefault !== undefined) {
+  if (args.makeDefault !== true) {
+   throw new Error('makeDefault only accepts true: Gmail always has exactly one default send-as address, so it is changed by promoting another address.');
+  }
+  requestBody.isDefault = true;
+ }
 
-    if (Object.keys(requestBody).length === 0) {
-        throw new Error('Nothing to update. Provide at least one of: displayName, replyToAddress, treatAsAlias, makeDefault.');
-    }
+ if (Object.keys(requestBody).length === 0) {
+  throw new Error('Nothing to update. Provide at least one of: displayName, replyToAddress, treatAsAlias, makeDefault.');
+ }
 
-    const sendAsEmail = await resolveSendAsAddress(gmail, args.sendAsEmail);
-    const response = await gmail.users.settings.sendAs.patch({
-        userId: 'me',
-        sendAsEmail,
-        requestBody,
-    });
+ const sendAsEmail = await resolveSendAsAddress(gmail, args.sendAsEmail);
+ const response = await gmail.users.settings.sendAs.patch({
+  userId: 'me',
+  sendAsEmail,
+  requestBody,
+ });
 
-    const current: SendAsAlias = response.data ?? { sendAsEmail };
-    const ignored = ignoredFields(requestBody, current);
+ const current: SendAsAlias = response.data ?? { sendAsEmail };
+ const ignored = ignoredFields(requestBody, current);
 
-    return { sendAsEmail, applied: requestBody, ignored, current };
+ return { sendAsEmail, applied: requestBody, ignored, current };
 }
 
 /**
@@ -425,42 +435,42 @@ export async function updateSendAs(gmail: GmailClient, args: UpdateSendAsArgs): 
  * field counts as equal to a falsy request rather than as a mismatch.
  */
 export function ignoredFields(
-    requestBody: Record<string, string | boolean>,
-    current: SendAsAlias,
+ requestBody: Record<string, string | boolean>,
+ current: SendAsAlias,
 ): string[] {
-    const ignored: string[] = [];
-    const record: Record<string, unknown> = { ...current };
-    for (const [field, requested] of Object.entries(requestBody)) {
-        const actual = record[field];
-        const normalized = actual === undefined || actual === null
-            ? (typeof requested === 'boolean' ? false : '')
-            : actual;
-        if (normalized !== requested) ignored.push(field);
-    }
-    return ignored;
+ const ignored: string[] = [];
+ const record: Record<string, unknown> = { ...current };
+ for (const [field, requested] of Object.entries(requestBody)) {
+  const actual = record[field];
+  const normalized = actual === undefined || actual === null
+   ? (typeof requested === 'boolean' ? false : '')
+   : actual;
+  if (normalized !== requested) ignored.push(field);
+ }
+ return ignored;
 }
 
 export interface SetVacationArgs {
-    enabled: boolean;
-    subject?: string;
-    /** Response body in Markdown. Rendered to HTML unless `bodyHtml` is given. */
-    body?: string;
-    /** Explicit HTML response body, used verbatim. */
-    bodyHtml?: string;
-    /** ISO date or datetime. A bare date is interpreted as UTC midnight. */
-    startTime?: string;
-    endTime?: string;
-    restrictToContacts?: boolean;
-    restrictToDomain?: boolean;
+ enabled: boolean;
+ subject?: string;
+ /** Response body in Markdown. Rendered to HTML unless `bodyHtml` is given. */
+ body?: string;
+ /** Explicit HTML response body, used verbatim. */
+ bodyHtml?: string;
+ /** ISO date or datetime. A bare date is interpreted as UTC midnight. */
+ startTime?: string;
+ endTime?: string;
+ restrictToContacts?: boolean;
+ restrictToDomain?: boolean;
 }
 
 /** Convert an ISO date or datetime to the epoch-millisecond string the API expects. */
 export function toEpochMillis(value: string, field: string): string {
-    const parsed = Date.parse(value);
-    if (Number.isNaN(parsed)) {
-        throw new Error(`${field} is not a valid date: "${value}". Use an ISO date (2026-08-20) or datetime (2026-08-20T09:00:00-07:00).`);
-    }
-    return String(parsed);
+ const parsed = Date.parse(value);
+ if (Number.isNaN(parsed)) {
+  throw new Error(`${field} is not a valid date: "${value}". Use an ISO date (2026-08-20) or datetime (2026-08-20T09:00:00-07:00).`);
+ }
+ return String(parsed);
 }
 
 /**
@@ -470,37 +480,37 @@ export function toEpochMillis(value: string, field: string): string {
  * without a Gmail client.
  */
 export function buildVacationSettings(current: VacationSettings, args: SetVacationArgs): VacationSettings {
-    const merged: VacationSettings = { ...current, enableAutoReply: args.enabled };
+ const merged: VacationSettings = { ...current, enableAutoReply: args.enabled };
 
-    if (args.subject !== undefined) merged.responseSubject = args.subject;
-    if (args.restrictToContacts !== undefined) merged.restrictToContacts = args.restrictToContacts;
-    if (args.restrictToDomain !== undefined) merged.restrictToDomain = args.restrictToDomain;
+ if (args.subject !== undefined) merged.responseSubject = args.subject;
+ if (args.restrictToContacts !== undefined) merged.restrictToContacts = args.restrictToContacts;
+ if (args.restrictToDomain !== undefined) merged.restrictToDomain = args.restrictToDomain;
 
-    if (args.bodyHtml !== undefined) {
-        merged.responseBodyHtml = args.bodyHtml;
-    } else if (args.body !== undefined) {
-        // Gmail prefers responseBodyHtml when both are present, so set both: the
-        // HTML for rendering clients and the Markdown source as the text part.
-        merged.responseBodyHtml = markdownToHtml(args.body);
-        merged.responseBodyPlainText = args.body;
-    }
+ if (args.bodyHtml !== undefined) {
+  merged.responseBodyHtml = args.bodyHtml;
+ } else if (args.body !== undefined) {
+  // Gmail prefers responseBodyHtml when both are present, so set both: the
+  // HTML for rendering clients and the Markdown source as the text part.
+  merged.responseBodyHtml = markdownToHtml(args.body);
+  merged.responseBodyPlainText = args.body;
+ }
 
-    if (args.startTime !== undefined) merged.startTime = toEpochMillis(args.startTime, 'startTime');
-    if (args.endTime !== undefined) merged.endTime = toEpochMillis(args.endTime, 'endTime');
+ if (args.startTime !== undefined) merged.startTime = toEpochMillis(args.startTime, 'startTime');
+ if (args.endTime !== undefined) merged.endTime = toEpochMillis(args.endTime, 'endTime');
 
-    if (merged.startTime && merged.endTime && Number(merged.startTime) >= Number(merged.endTime)) {
-        throw new Error('startTime must precede endTime.');
-    }
+ if (merged.startTime && merged.endTime && Number(merged.startTime) >= Number(merged.endTime)) {
+  throw new Error('startTime must precede endTime.');
+ }
 
-    if (args.enabled) {
-        const hasSubject = !!merged.responseSubject?.trim();
-        const hasBody = !!(merged.responseBodyHtml?.trim() || merged.responseBodyPlainText?.trim());
-        if (!hasSubject && !hasBody) {
-            throw new Error('Gmail requires a nonempty subject or body to enable the vacation responder. Provide "subject" or "body".');
-        }
-    }
+ if (args.enabled) {
+  const hasSubject = !!merged.responseSubject?.trim();
+  const hasBody = !!(merged.responseBodyHtml?.trim() || merged.responseBodyPlainText?.trim());
+  if (!hasSubject && !hasBody) {
+   throw new Error('Gmail requires a nonempty subject or body to enable the vacation responder. Provide "subject" or "body".');
+  }
+ }
 
-    return merged;
+ return merged;
 }
 
 /**
@@ -512,13 +522,13 @@ export function buildVacationSettings(current: VacationSettings, args: SetVacati
  * result rather than the request, so enabling against an existing body works.
  */
 export async function setVacationResponder(gmail: GmailClient, args: SetVacationArgs): Promise<VacationSettings> {
-    const currentResponse = await gmail.users.settings.getVacation({ userId: 'me' });
-    const merged = buildVacationSettings(currentResponse.data ?? {}, args);
+ const currentResponse = await gmail.users.settings.getVacation({ userId: 'me' });
+ const merged = buildVacationSettings(currentResponse.data ?? {}, args);
 
-    const response = await gmail.users.settings.updateVacation({
-        userId: 'me',
-        requestBody: merged,
-    });
+ const response = await gmail.users.settings.updateVacation({
+  userId: 'me',
+  requestBody: merged,
+ });
 
-    return response.data ?? merged;
+ return response.data ?? merged;
 }
