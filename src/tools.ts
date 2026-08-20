@@ -283,7 +283,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "search_emails",
-    description: "Searches for emails using Gmail search syntax",
+    description: "Searches for emails using Gmail search syntax Draft message ids rotate when a draft is saved, so a previously returned id can 404; re-search or use list_drafts rather than caching draft message ids.",
     schema: SearchEmailsSchema,
     scopes: ["gmail.readonly", "gmail.modify"],
     annotations: { title: "Search Emails", readOnlyHint: true },
