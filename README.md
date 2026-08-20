@@ -915,6 +915,8 @@ Discards an abandoned draft via `users.drafts.delete`.
 
 #### Canonical draft lifecycle
 
+Draft message ids rotate whenever a draft is saved (by the user in Gmail or by an update), so a message id captured from `search_emails` can 404 later; that reads as deletion but is not. Identify drafts with `list_drafts` or by re-searching, and address them by their stable `r`-prefixed draft id.
+
 ```
 draft_email(...) → draftId
   ↓ (user wants changes)
