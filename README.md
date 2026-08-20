@@ -974,6 +974,8 @@ Reads the whole `users.settings` surface in one call: send-as addresses and thei
 Could not read this section: not permitted (403): Delegation is not supported for this account.
 ```
 
+Send-as entries print the signature twice: a tag-stripped one-line preview for skimming, then `signature html:` with the stored markup verbatim. The full markup matters because `set_signature` replaces rather than merges, so anything the reader cannot see is content a caller would destroy without ever knowing it existed.
+
 It never prints `None configured.` for a section it could not read. "No delegates" and "not allowed to ask about delegates" are different answers, and only one of them is safe to act on. `None configured.` appears only when the read actually succeeded and came back empty.
 
 This makes the tool usable as a quick exfiltration check: auto-forwarding and forwarding addresses are readable with ordinary scopes, so you can see whether anything is siphoning mail out of the account.
