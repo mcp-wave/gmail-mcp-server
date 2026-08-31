@@ -147,6 +147,58 @@ export function createEmailMessage(validatedArgs: any): string {
 }
 
 
+/**
+ * An attachment as a caller supplies it: a path on this machine, or the bytes
+ * inline. Remote callers have no path on this machine to name, so inline is
+ * the only form available to them.
+ */
+export type AttachmentInput = string | { filename: string; content: string; mimeType?: string };
+
+/** What nodemailer needs: a path to read, or a buffer to embed. */
+type NodemailerAttachment =
+ | { filename: string; path: string }
+ | { filename: string; content: Buffer; contentType: string };
+
+/**
+ * Turn caller-supplied attachments into nodemailer attachments.
+ *
+ * Base64 is validated rather than handed straight to Buffer.from, which
+ * silently discards anything it cannot decode: a mangled payload would
+ * otherwise become a truncated or empty file the recipient discovers, instead
+ * of an error the caller does.
+ */
+export function resolveAttachments(inputs: AttachmentInput[] = []): NodemailerAttachment[] {
+ return inputs.map((input, index) => {
+  if (typeof input === 'string') {
+   if (!fs.existsSync(input)) {
+    throw new Error(
+     `File does not exist: ${input}. A file path is only resolvable when this server runs on the same machine as the caller; ` +
+     `otherwise supply the bytes inline as {"filename": ..., "content": <base64>}.`,
+    );
+   }
+   return { filename: path.basename(input), path: input };
+  }
+
+  if (!input.filename) throw new Error(`Attachment ${index + 1} has no filename.`);
+  const label = `"${input.filename}"`;
+
+  const base64 = (input.content ?? '').replace(/\s+/g, '');
+  if (!base64) throw new Error(`Attachment ${label} has empty content.`);
+  if (base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64)) {
+   throw new Error(`Attachment ${label} has content that is not valid base64.`);
+  }
+
+  const content = Buffer.from(base64, 'base64');
+  if (content.length === 0) throw new Error(`Attachment ${label} decodes to zero bytes.`);
+
+  return {
+   filename: input.filename,
+   content,
+   contentType: input.mimeType || mimeLookup(input.filename) || 'application/octet-stream',
+  };
+ });
+}
+
 export async function createEmailWithNodemailer(validatedArgs: any): Promise<string> {
  // Validate email addresses
  (validatedArgs.to as string[]).forEach(email => {
@@ -162,20 +214,7 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
   buffer: true
  });
 
- // Prepare attachments for nodemailer
- const attachments = [];
- for (const filePath of validatedArgs.attachments) {
-  if (!fs.existsSync(filePath)) {
-   throw new Error(`File does not exist: ${filePath}`);
-  }
-
-  const fileName = path.basename(filePath);
-
-  attachments.push({
-   filename: fileName,
-   path: filePath
-  });
- }
+ const attachments = resolveAttachments(validatedArgs.attachments);
 
  // Resolve the body parts: Markdown-rendered HTML by default (see resolveBodyParts).
  // nodemailer omits a part entirely when its field is undefined, which is how

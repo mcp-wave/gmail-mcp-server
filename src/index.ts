@@ -15,7 +15,7 @@ import { fileURLToPath } from 'url';
 import http from 'http';
 import open from 'open';
 import os from 'os';
-import { createEmailMessage, createEmailWithNodemailer } from "./utl.js";
+import { createEmailMessage, createEmailWithNodemailer, type AttachmentInput } from "./utl.js";
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
@@ -1426,8 +1426,8 @@ function createMcpServer(resolveSession: ResolveSession): Server {
 
      // Build the new MIME message using the same helpers as draft_email/send_email
      let message: string;
-     const attachmentPaths = messageArgs.attachments as string[] | undefined;
-     if (attachmentPaths && attachmentPaths.length > 0) {
+     const newAttachments = messageArgs.attachments as AttachmentInput[] | undefined;
+     if (newAttachments && newAttachments.length > 0) {
       message = await createEmailWithNodemailer(messageArgs);
      } else {
       message = createEmailMessage(messageArgs);
