@@ -52,7 +52,7 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 ## Features
 
 - Send emails with subject, content, **attachments**, and recipients
-- **Full attachment support** - send and receive file attachments
+- **Attachments from anywhere** — send the bytes inline as base64, so a remote client with no filesystem on the server can still attach files; local paths still work for a stdio deployment
 - **Download email attachments** to local filesystem
 - **Download full emails** to files in json/eml/txt/html formats
 - **Thread-level operations** — get full threads, list inbox threads, batch-expand threads
@@ -484,16 +484,34 @@ Basic Email (Markdown, sent as HTML plus plain text):
 ```
 
 **Email with Attachments:**
+
+Each attachment is either the bytes inline, or a path on the machine running
+the server. Inline is the only form available to a remote client, which has no
+path on the server to name:
+
 ```json
 {
   "to": ["recipient@example.com"],
   "subject": "Project Files",
   "body": "Hi,\n\nPlease find the project files attached.\n\nBest regards",
   "attachments": [
-    "/path/to/document.pdf",
-    "/path/to/spreadsheet.xlsx",
-    "/path/to/presentation.pptx"
+    { "filename": "document.pdf", "content": "JVBERi0xLjQK...", "mimeType": "application/pdf" },
+    { "filename": "notes.txt", "content": "aGVsbG8gd29ybGQ=" }
   ]
+}
+```
+
+`content` is base64. `mimeType` is inferred from the filename when omitted.
+Invalid base64 is rejected rather than silently truncated.
+
+When the server runs locally alongside the caller (stdio), a path still works:
+
+```json
+{
+  "to": ["recipient@example.com"],
+  "subject": "Project Files",
+  "body": "Please find the files attached.",
+  "attachments": ["/path/to/document.pdf", "/path/to/spreadsheet.xlsx"]
 }
 ```
 
@@ -528,7 +546,7 @@ HTML Only (no plain-text part):
 | blank `body`, no `htmlBody` | single `text/plain` part |
 
 ### 2. Draft Email (`draft_email`)
-Creates a draft email without sending it. **Also supports attachments**. The `body` is Markdown and follows the same HTML-by-default rules as `send_email`.
+Creates a draft email without sending it. Attachments take the same two forms as `send_email`. The `body` is Markdown and follows the same HTML-by-default rules as `send_email`.
 
 ```json
 {
@@ -536,7 +554,7 @@ Creates a draft email without sending it. **Also supports attachments**. The `bo
   "subject": "Draft Report",
   "body": "Here's the draft report for your review.",
   "cc": ["manager@example.com"],
-  "attachments": ["/path/to/draft_report.docx"]
+  "attachments": [{ "filename": "draft_report.docx", "content": "UEsDBBQA..." }]
 }
 ```
 
@@ -762,7 +780,7 @@ Replies to all recipients of an email. Automatically fetches the original email 
   "messageId": "182ab45cd67ef",
   "body": "Thanks for the update. See attached notes.",
   "htmlBody": "<p>Thanks for the update. See attached notes.</p>",
-  "attachments": ["/path/to/notes.pdf"]
+  "attachments": [{ "filename": "notes.pdf", "content": "JVBERi0xLjQK..." }]
 }
 ```
 
@@ -771,7 +789,7 @@ Parameters:
 - `body` (required): Reply body in Markdown, rendered to HTML by default
 - `htmlBody` (optional): Explicit HTML body, used verbatim instead of the rendered Markdown
 - `mimeType` (optional): override the default `multipart/alternative`; `text/plain` for plain text only, `text/html` for HTML only
-- `attachments` (optional): Array of file paths to attach
+- `attachments` (optional): Array of attachments, each either `{filename, content (base64), mimeType?}` or a path on the machine running the server
 
 ### 21. Modify Thread (`modify_thread`)
 Atomically modifies labels on an entire thread (all messages at once). Solves the problem where archiving only the latest message leaves older messages in the inbox.
@@ -895,10 +913,12 @@ An edit to a draft that already has attachments is **refused** unless you either
 
 ```
 This draft has 1 attachment(s) (contract.pdf) that an edit cannot preserve: Gmail
-holds the bytes and rebuilding the message needs local file paths.
+holds the bytes and rebuilding the message needs them again. Re-supply them with
+"attachments" (inline base64, or a path on the machine running this server), or
+pass "dropAttachments": true to remove them deliberately.
 ```
 
-Gmail stores the attachment bytes, and rebuilding the MIME body requires the original local file paths, which this server does not retain between calls. Silently dropping them was the old behavior.
+Gmail stores the attachment bytes and this server does not retain them between calls, so rebuilding the MIME body needs them again. Silently dropping them was the old behavior.
 
 #### One thing that is not preserved
 
@@ -1242,7 +1262,7 @@ You can combine multiple operators: `from:john@example.com after:2024/01/01 has:
 
 The server provides comprehensive attachment functionality:
 
-- **Sending Attachments**: Include file paths in the `attachments` array when sending or drafting emails
+- **Sending Attachments**: Supply each attachment inline as `{filename, content (base64), mimeType?}`, or as a path on the machine running the server. Remote clients have no server-side path, so inline is their only form.
 - **Attachment Detection**: Automatically detects MIME types and file sizes
 - **Download Capability**: Download any email attachment to your local filesystem
 - **Enhanced Display**: View detailed attachment information including filenames, types, sizes, and download IDs
@@ -1324,8 +1344,9 @@ The server includes efficient batch processing capabilities:
    - Consider reducing the batch size if you encounter rate limiting
 
 5. **Attachment Issues**
-   - **File Not Found**: Ensure attachment file paths are correct and accessible
-   - **Permission Errors**: Check that the server has read access to attachment files
+   - **File Not Found**: A file path is resolved on the machine running the server. If you are talking to a remote server, no path of yours exists there: send the bytes inline as `{filename, content}` instead.
+   - **Not Valid Base64**: Inline `content` must be base64. It is validated rather than silently truncated, so fix the encoding rather than retrying.
+   - **Permission Errors**: For the path form, check that the server has read access to the file
    - **Size Limits**: Gmail has a 25MB attachment size limit per email
    - **Download Failures**: Verify you have write permissions to the download directory
 
