@@ -16,6 +16,7 @@ import http from 'http';
 import open from 'open';
 import os from 'os';
 import { createEmailMessage, createEmailWithNodemailer } from "./utl.js";
+import { resolveSignature, invalidateSignatureCache, type SignatureParts } from "./signature.js";
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
@@ -785,6 +786,24 @@ function createMcpServer(resolveSession: ResolveSession): Server {
    return { allow: true };
   }
 
+  // Resolve an outgoing signature for the sending identity, returning both
+  // the signature parts and any note to surface in the response. A read
+  // failure must never block the send, but must report why it went out unsigned.
+  async function outgoingSignature(
+   from: string | undefined,
+   include: boolean,
+  ): Promise<{ signature: SignatureParts | null; note: string; sendAsEmail?: string }> {
+   if (!include) return { signature: null, note: '' };
+   const res = await resolveSignature(gmail, sendCtx.ownEmail, from);
+   if (res.status === 'ok') {
+    return { signature: res.parts, note: '', sendAsEmail: res.sendAsEmail };
+   }
+   return {
+    signature: null,
+    note: `Note: Signature unavailable (${res.reason}). Outgoing message unsigned.`,
+   };
+  }
+
   async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
    // Enforce the per-account send policy before actually sending.
    if (action === "send") {
@@ -842,10 +861,16 @@ function createMcpServer(resolveSession: ResolveSession): Server {
      }
     }
 
+    const { signature, note, sendAsEmail } = await outgoingSignature(
+     validatedArgs.from,
+     validatedArgs.includeSignature !== false,
+    );
+    const statusSuffix = (signature ? ` (signature appended from ${sendAsEmail || validatedArgs.from || sendCtx.ownEmail})` : '') + (note ? `\n${note}` : '');
+
     // Check if we have attachments
     if (validatedArgs.attachments && validatedArgs.attachments.length > 0) {
      // Use Nodemailer to create properly formatted RFC822 message
-     message = await createEmailWithNodemailer(validatedArgs);
+     message = await createEmailWithNodemailer(validatedArgs, signature);
 
      if (action === "send") {
       const encodedMessage = Buffer.from(message).toString('base64')
@@ -865,7 +890,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
        content: [
         {
          type: "text",
-         text: `Email sent successfully with ID: ${result.data.id}`,
+         text: `Email sent successfully with ID: ${result.data.id}${statusSuffix}`,
         },
        ],
       };
@@ -891,14 +916,14 @@ function createMcpServer(resolveSession: ResolveSession): Server {
        content: [
         {
          type: "text",
-         text: `Email draft created successfully with ID: ${response.data.id}`,
+         text: `Email draft created successfully with ID: ${response.data.id}${statusSuffix}`,
         },
        ],
       };
      }
     } else {
      // For emails without attachments, use the existing simple method
-     message = createEmailMessage(validatedArgs);
+     message = createEmailMessage(validatedArgs, signature);
 
      const encodedMessage = Buffer.from(message).toString('base64')
       .replace(/\+/g, '-')
@@ -929,7 +954,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
        content: [
         {
          type: "text",
-         text: `Email sent successfully with ID: ${response.data.id}`,
+         text: `Email sent successfully with ID: ${response.data.id}${statusSuffix}`,
         },
        ],
       };
@@ -944,7 +969,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
        content: [
         {
          type: "text",
-         text: `Email draft created successfully with ID: ${response.data.id}`,
+         text: `Email draft created successfully with ID: ${response.data.id}${statusSuffix}`,
         },
        ],
       };
@@ -1403,7 +1428,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
 
     case "update_draft": {
      const validatedArgs = UpdateDraftSchema.parse(args);
-     const { draftId, baseToken, dropAttachments, ...editArgs } = validatedArgs;
+     const { draftId, baseToken, dropAttachments, includeSignature, ...editArgs } = validatedArgs;
 
      // Read the live draft first. The user may have edited it in Gmail
      // since the agent last saw it, and drafts.update replaces the whole
@@ -1424,13 +1449,22 @@ function createMcpServer(resolveSession: ResolveSession): Server {
      const merged = mergeDraftEdit(current, { ...editArgs, dropAttachments });
      const messageArgs = merged.messageArgs;
 
+     // Resolve the signature using the merged From address (preserving the draft's
+     // alias when not overridden). We do not special-case preserved bodies here:
+     // resolveBodyParts handles signatures idempotently, so if the draft body already
+     // ends with this signature, nothing is added.
+     const { signature, note } = await outgoingSignature(
+      messageArgs.from as string | undefined,
+      includeSignature !== false,
+     );
+
      // Build the new MIME message using the same helpers as draft_email/send_email
      let message: string;
      const attachmentPaths = messageArgs.attachments as string[] | undefined;
      if (attachmentPaths && attachmentPaths.length > 0) {
-      message = await createEmailWithNodemailer(messageArgs);
+      message = await createEmailWithNodemailer(messageArgs, signature);
      } else {
-      message = createEmailMessage(messageArgs);
+      message = createEmailMessage(messageArgs, signature);
      }
 
      const encodedMessage = Buffer.from(message).toString('base64')
@@ -1459,7 +1493,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
        {
         type: "text",
         text: `Draft ${draftId} updated (ID unchanged). Changes: ${describeMerge(merged)}.\n` +
-         `New baseToken for further edits: ${newToken}`,
+         `New baseToken for further edits: ${newToken}${note ? `\n${note}` : ''}`,
        },
       ],
      };
@@ -1868,6 +1902,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
     case "set_signature": {
      const validatedArgs = SetSignatureSchema.parse(args);
      const result = await setSignature(gmail, validatedArgs);
+     invalidateSignatureCache(sendCtx.ownEmail);
      const parts = [`Signature updated for ${result.sendAsEmail}.`];
      if (result.storedSignature === '') {
       parts.push('The signature is now empty.');
@@ -1876,13 +1911,14 @@ function createMcpServer(resolveSession: ResolveSession): Server {
       // implying the sent markup was stored verbatim.
       parts.push(`Gmail sanitized the HTML on save. Stored value:\n${result.storedSignature}`);
      }
-     parts.push('Note: this is the signature Gmail adds when composing in the web UI. It is not appended to mail sent through send_email.');
+     parts.push('Note: this is the same signature this server now appends to outgoing mail by default (send_email, draft_email, reply_all, update_draft), and includeSignature: false opts a message out.');
      return { content: [{ type: "text", text: parts.join('\n') }] };
     }
 
     case "update_send_as": {
      const validatedArgs = UpdateSendAsSchema.parse(args);
      const result = await updateSendAs(gmail, validatedArgs);
+     invalidateSignatureCache(sendCtx.ownEmail);
      const changed = Object.entries(result.applied)
       .filter(([field]) => !result.ignored.includes(field))
       .map(([field, value]) => `${field}: ${JSON.stringify(value)}`);
@@ -2382,17 +2418,30 @@ function createMcpServer(resolveSession: ResolveSession): Server {
       inReplyTo: originalMessageId,
       attachments: validatedArgs.attachments,
       from: validatedArgs.from, // send as a configured send-as alias
+      includeSignature: validatedArgs.includeSignature,
      };
 
      // Use the existing handleEmailAction to send the reply
      const result = await handleEmailAction("send", emailArgs);
 
-     // Enhance the response with reply-all specific info
+     // handleEmailAction returns an MCP response object ({ content: [...] }).
+     // If a send policy check denied the send, gateSend returned the denial
+     // result directly without throwing. Because handleEmailAction's contract is
+     // an MCP response rather than a status object, we check whether the primary
+     // text starts with the literal success prefix handleEmailAction produces for sends.
+     const primaryText = result?.content?.[0]?.text;
+     const isSuccess = typeof primaryText === 'string' && primaryText.startsWith('Email sent successfully with ID:');
+     if (!isSuccess) {
+      return result;
+     }
+
+     // Enhance the response with reply-all specific info, including the underlying
+     // result text (message ID and any signature note) beneath the summary.
      return {
       content: [
        {
         type: "text",
-        text: `Reply-all sent successfully!\nTo: ${replyTo.join(', ')}${replyCc.length > 0 ? `\nCC: ${replyCc.join(', ')}` : ''}\nSubject: ${replySubject}\nThread ID: ${threadId}`,
+        text: `Reply-all sent successfully!\nTo: ${replyTo.join(', ')}${replyCc.length > 0 ? `\nCC: ${replyCc.join(', ')}` : ''}\nSubject: ${replySubject}\nThread ID: ${threadId}\n\n${primaryText}`,
        },
       ],
      };

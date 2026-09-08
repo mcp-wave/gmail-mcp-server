@@ -57,6 +57,7 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 - **Download full emails** to files in json/eml/txt/html formats
 - **Thread-level operations** — get full threads, list inbox threads, batch-expand threads
 - **Markdown bodies rendered to HTML by default** — every composed message goes out as `multipart/alternative` (rendered HTML plus a plain-text part) unless you opt out with `mimeType`
+- **Gmail signatures appended by default**: `send_email`, `draft_email`, `reply_all` and `update_draft` append the signature configured for the sending alias, never twice however many times a draft is read back and edited, with `includeSignature: false` to opt one message out
 - **No more stranded drafts** — trashing a draft is refused (it leaves a message Gmail calls deleted but IMAP clients still list as a draft), and `repair_drafts` cleans up any already in that state
 - **Draft edits cannot clobber your own changes** — revising a draft requires reading it first, the edit is refused if the draft changed since that read, and fields you omit keep their current values
 - Full support for international characters in subject lines and email content
@@ -517,6 +518,20 @@ HTML Only (no plain-text part):
 }
 ```
 
+**Opting out of the signature (`includeSignature: false`):**
+```json
+{
+  "to": ["recipient@example.com"],
+  "subject": "System Notification",
+  "body": "Automated alert: batch run completed successfully.",
+  "includeSignature": false
+}
+```
+
+By default, `send_email` and `draft_email` append the Gmail signature configured for the sending alias (`includeSignature: true`). It is never doubled: a copy already in the body is removed wherever it sits and exactly one is put back at the end, and an HTML body already carrying a `gmail_signature` block is left as it is. That matters for the `draft_email` then `read_draft` then `update_draft` cycle, because `read_draft` hands back a body with the signature already in it, and an edit that adds text below it would otherwise produce two.
+
+The signature is read from `users.settings.sendAs` for the sending address, which needs a scope that can read settings (`gmail.readonly`, `gmail.modify`, or `gmail.settings.basic`). If it cannot be read, or the alias has no signature configured, the message still goes out, unsigned, and the tool response says so.
+
 **Body field reference:**
 
 | Input | Result |
@@ -766,13 +781,23 @@ Replies to all recipients of an email. Automatically fetches the original email 
 }
 ```
 
+**Opting out of the signature (`includeSignature: false`):**
+```json
+{
+  "messageId": "182ab45cd67ef",
+  "body": "Acknowledged.",
+  "includeSignature": false
+}
+```
+
 Parameters:
 - `messageId` (required): ID of the email to reply to
 - `body` (required): Reply body in Markdown, rendered to HTML by default
+- `includeSignature` (optional, default `true`): whether to append the sender's configured Gmail signature. It is never doubled: a copy already in the body is removed wherever it sits and exactly one is put back at the end, and an HTML body already carrying a `gmail_signature` block is left as it is.
 - `htmlBody` (optional): Explicit HTML body, used verbatim instead of the rendered Markdown
 - `mimeType` (optional): override the default `multipart/alternative`; `text/plain` for plain text only, `text/html` for HTML only
 - `attachments` (optional): Array of file paths to attach
-
+- `from` (optional): Send-as alias to send the reply from
 ### 21. Modify Thread (`modify_thread`)
 Atomically modifies labels on an entire thread (all messages at once). Solves the problem where archiving only the latest message leaves older messages in the inbox.
 
@@ -855,6 +880,18 @@ Revises a draft in place via `users.drafts.update`, **preserving the draft ID**,
   "subject": "Revised Report"
 }
 ```
+
+**Opting out of the signature:**
+```json
+{
+  "draftId": "r-1234567890123456789",
+  "baseToken": "v1:msg-abc123:hist-456",
+  "body": "Short reply without signature.",
+  "includeSignature": false
+}
+```
+
+`update_draft` appends the sender's configured Gmail signature by default (`includeSignature: true`), and never doubles it. Keeping the draft's existing body leaves the copy already there. Handing back a body read from `read_draft`, with the signature still in it and new text added below, moves that copy to the end rather than adding a second one.
 
 #### It cannot overwrite what you wrote
 
@@ -992,7 +1029,7 @@ Sets the Gmail signature on a send-as address. The signature is **Markdown**, re
 
 Targets the account's default From address unless `sendAsEmail` names another. Pass `signatureHtml` instead to save hand-authored HTML verbatim, or `"signature": ""` to clear it.
 
-> **This is the web-UI signature.** Gmail documents `signature` as the signature added when composing **in the Gmail web interface**. It is *not* appended to mail sent through this server's `send_email` / `reply_all` tools. To sign an API-sent message, put the signature in the body.
+> **Gmail signature integration.** This is the signature the server appends to outgoing mail by default (`send_email`, `draft_email`, `reply_all`, `update_draft`), and it is also what Gmail's web composer uses. Set `includeSignature: false` on any send or draft call to opt out for that message.
 
 Gmail sanitizes signature HTML server-side. The tool reads back what Gmail stored and tells you when it differs from what was sent.
 
