@@ -57,7 +57,7 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 - **Download full emails** to files in json/eml/txt/html formats
 - **Thread-level operations** — get full threads, list inbox threads, batch-expand threads
 - **Markdown bodies rendered to HTML by default** — every composed message goes out as `multipart/alternative` (rendered HTML plus a plain-text part) unless you opt out with `mimeType`
-- **Gmail signatures appended by default**: outgoing mail sent via `send_email`, `draft_email`, `reply_all`, or `update_draft` automatically appends the sender's configured Gmail signature, with idempotent deduplication and an `includeSignature: false` opt-out
+- **Gmail signatures appended by default**: `send_email`, `draft_email`, `reply_all` and `update_draft` append the signature configured for the sending alias, never twice however many times a draft is read back and edited, with `includeSignature: false` to opt one message out
 - **No more stranded drafts** — trashing a draft is refused (it leaves a message Gmail calls deleted but IMAP clients still list as a draft), and `repair_drafts` cleans up any already in that state
 - **Draft edits cannot clobber your own changes** — revising a draft requires reading it first, the edit is refused if the draft changed since that read, and fields you omit keep their current values
 - Full support for international characters in subject lines and email content
@@ -528,7 +528,10 @@ HTML Only (no plain-text part):
 }
 ```
 
-By default, `send_email` and `draft_email` append the Gmail signature configured for the sending alias (`includeSignature: true`). Appending is idempotent: if the body already ends with the signature, or already carries a `gmail_signature` block, no duplicate is added. The signature is read from `users.settings.sendAs` for the sending address, which requires settings read permissions (`gmail.readonly`, `gmail.modify`, or `gmail.settings.basic`); if settings cannot be read or no signature is configured, the message is sent unsigned and the response notes this.
+By default, `send_email` and `draft_email` append the Gmail signature configured for the sending alias (`includeSignature: true`). It is never doubled: a copy already in the body is removed wherever it sits and exactly one is put back at the end, and an HTML body already carrying a `gmail_signature` block is left as it is. That matters for the `draft_email` then `read_draft` then `update_draft` cycle, because `read_draft` hands back a body with the signature already in it, and an edit that adds text below it would otherwise produce two.
+
+The signature is read from `users.settings.sendAs` for the sending address, which needs a scope that can read settings (`gmail.readonly`, `gmail.modify`, or `gmail.settings.basic`). If it cannot be read, or the alias has no signature configured, the message still goes out, unsigned, and the tool response says so.
+
 **Body field reference:**
 
 | Input | Result |
@@ -790,7 +793,7 @@ Replies to all recipients of an email. Automatically fetches the original email 
 Parameters:
 - `messageId` (required): ID of the email to reply to
 - `body` (required): Reply body in Markdown, rendered to HTML by default
-- `includeSignature` (optional, default `true`): whether to append the sender's configured Gmail signature. Appending is idempotent: a body already ending with the signature or carrying a `gmail_signature` block is left untouched.
+- `includeSignature` (optional, default `true`): whether to append the sender's configured Gmail signature. It is never doubled: a copy already in the body is removed wherever it sits and exactly one is put back at the end, and an HTML body already carrying a `gmail_signature` block is left as it is.
 - `htmlBody` (optional): Explicit HTML body, used verbatim instead of the rendered Markdown
 - `mimeType` (optional): override the default `multipart/alternative`; `text/plain` for plain text only, `text/html` for HTML only
 - `attachments` (optional): Array of file paths to attach
@@ -888,7 +891,7 @@ Revises a draft in place via `users.drafts.update`, **preserving the draft ID**,
 }
 ```
 
-`update_draft` appends the sender's configured Gmail signature by default (`includeSignature: true`). Appending is idempotent: keeping the draft's existing body or supplying a body that already ends with the signature does not create a double signature.
+`update_draft` appends the sender's configured Gmail signature by default (`includeSignature: true`), and never doubles it. Keeping the draft's existing body leaves the copy already there. Handing back a body read from `read_draft`, with the signature still in it and new text added below, moves that copy to the end rather than adding a second one.
 
 #### It cannot overwrite what you wrote
 

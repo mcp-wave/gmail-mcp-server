@@ -14,7 +14,7 @@ export const SendEmailSchema = z.object({
   threadId: z.string().optional().describe("Thread ID to reply to"),
   inReplyTo: z.string().optional().describe("Message ID being replied to"),
   attachments: z.array(z.string()).optional().describe("List of file paths to attach to the email"),
-  includeSignature: z.boolean().optional().default(true).describe("Whether to append the Gmail signature configured for the sending address. Defaults to true. Set false when the body already carries a signature or none is wanted. Appending is idempotent: a body that already ends with the signature, or already carries a gmail_signature block, is left untouched."),
+  includeSignature: z.boolean().optional().default(true).describe("Whether to append the Gmail signature configured for the sending address. Defaults to true. Set false when the body already carries a signature or none is wanted. Appending never doubles it: a copy already in the body is removed wherever it sits and exactly one is put back at the end, and an HTML body already carrying a gmail_signature block is left as it is."),
 });
 
 export const ReadEmailSchema = z.object({
@@ -69,7 +69,7 @@ export const UpdateDraftSchema = z.object({
   inReplyTo: z.string().optional().describe("Message ID being replied to"),
   attachments: z.array(z.string()).optional().describe("File paths to attach, replacing the draft's current attachments. An edit to a draft that already has attachments must either re-supply them here or set dropAttachments, because Gmail holds the bytes and they cannot be rebuilt from the draft."),
   dropAttachments: z.boolean().optional().describe("Deliberately remove the draft's existing attachments. Only needed when the draft has attachments and you are not re-supplying them."),
-  includeSignature: z.boolean().optional().default(true).describe("Whether to append the Gmail signature configured for the sending address. Defaults to true. Set false when the body already carries a signature or none is wanted. Appending is idempotent: keeping the draft's existing body does not add a second copy, and a body already ending with the signature or carrying a gmail_signature block is left untouched."),
+  includeSignature: z.boolean().optional().default(true).describe("Whether to append the Gmail signature configured for the sending address. Defaults to true. Set false when the body already carries a signature or none is wanted. Appending never doubles it, so keeping the draft's existing body, or handing back a body read from read_draft with the signature still in it, leaves exactly one copy at the end."),
 });
 
 export const ListEmailLabelsSchema = z.object({}).describe("Retrieves all available Gmail labels");
@@ -214,7 +214,7 @@ export const ReplyAllSchema = z.object({
   htmlBody: z.string().optional().describe("Explicit HTML body. Overrides the HTML rendered from the Markdown body; only needed for hand-authored HTML."),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().describe("Override the content type. Omit for the default multipart/alternative (Markdown-rendered HTML plus plain text). Use 'text/plain' only when a plain-text-only message is explicitly required."),
   attachments: z.array(z.string()).optional().describe("List of file paths to attach to the reply"),
-  includeSignature: z.boolean().optional().default(true).describe("Whether to append the Gmail signature configured for the sending address. Defaults to true. Set false when the body already carries a signature or none is wanted. Appending is idempotent: a body that already ends with the signature, or already carries a gmail_signature block, is left untouched."),
+  includeSignature: z.boolean().optional().default(true).describe("Whether to append the Gmail signature configured for the sending address. Defaults to true. Set false when the body already carries a signature or none is wanted. Appending never doubles it: a copy already in the body is removed wherever it sits and exactly one is put back at the end, and an HTML body already carrying a gmail_signature block is left as it is."),
   from: z.string().optional().describe("Send the reply as this address (must be a configured send-as alias in Gmail settings). Defaults to the account's default send-as address. Use list_send_as to discover available aliases."),
 });
 

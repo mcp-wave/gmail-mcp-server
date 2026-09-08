@@ -22,7 +22,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createEmailMessage, resolveBodyParts } from './utl.js';
 import type { SignatureParts } from './signature.js';
-import { SIGNATURE_MARKER } from './signature.js';
+import { SIGNATURE_MARKER, wrapSignatureHtml } from './signature.js';
 
 // Resolve src directory
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -171,6 +171,8 @@ describe('Email signatures', () => {
   text: '-- \nJane Doe\nAcme Corp',
   html: '<p>-- <br><b>Jane Doe</b><br>Acme Corp</p>',
  };
+ // Counting copies is the whole point of these tests, so every one of them uses this.
+ const occurrences = (haystack: string, needle: string) => haystack.split(needle).length - 1;
 
  it('carries the signature in both text and HTML parts of a default multipart message', () => {
   const raw = createEmailMessage(
@@ -211,15 +213,50 @@ describe('Email signatures', () => {
   const resolved = resolveBodyParts({ body: bodyWithSig }, signature);
 
   expect(resolved.text).toBe(bodyWithSig);
+ });
 
-  // Normalisation handles CRLF and trailing spaces
-  const bodyWithCrlfSig = 'Hello world\r\n\r\n--   \r\nJane Doe  \r\nAcme Corp\r\n';
-  const resolvedCrlf = resolveBodyParts({ body: bodyWithCrlfSig }, signature);
-  expect(resolvedCrlf.text).toBe(bodyWithCrlfSig);
+ it('recognises a stored copy whose line endings changed in transit', () => {
+  // A body read back out of MIME arrives with CRLF and padded lines, so a byte
+  // comparison against the stored signature would miss the copy it is meant to find.
+  const fromMime = 'Hello world\r\n\r\n--   \r\nJane Doe  \r\nAcme Corp\r\n';
+  const resolved = resolveBodyParts({ body: fromMime }, signature);
+
+  expect(occurrences(resolved.text ?? '', 'Jane Doe')).toBe(1);
+  expect((resolved.text ?? '').endsWith(signature.text)).toBe(true);
+ });
+
+ it('moves a signature that is no longer last back to the end rather than adding another', () => {
+  // What an agent produces after editing what read_draft handed it: the
+  // signature ends up mid-body with new prose beneath it.
+  const edited = `Hello world\n\n${signature.text}\n\nAdded after the signature.`;
+  const resolved = resolveBodyParts({ body: edited }, signature);
+
+  expect(occurrences(resolved.text ?? '', 'Jane Doe')).toBe(1);
+  expect(resolved.text).toBe(`Hello world\n\nAdded after the signature.\n\n${signature.text}`);
+ });
+
+ it('collapses a body that already carries two copies down to one', () => {
+  const doubled = `Hello world\n\n${signature.text}\n\n${signature.text}`;
+  const resolved = resolveBodyParts({ body: doubled }, signature);
+
+  expect(occurrences(resolved.text ?? '', 'Jane Doe')).toBe(1);
+ });
+
+ it('renders the HTML part from the body with the signature taken out', () => {
+  // Otherwise the plain-text signature in the body renders into the HTML part as
+  // ordinary Markdown, where there is no signature block to recognise and the
+  // real one gets appended underneath it.
+  const bodyCarryingSig = `Hello world\n\n${signature.text}`;
+  const resolved = resolveBodyParts({ body: bodyCarryingSig }, signature);
+
+  expect(occurrences(resolved.html ?? '', 'Jane Doe')).toBe(1);
+  expect(resolved.html).toContain(SIGNATURE_MARKER);
  });
 
  it('leaves body HTML alone when it already contains a gmail_signature block', () => {
-  const existingHtml = `<p>Hello</p><div class="${SIGNATURE_MARKER}">Old Signature</div>`;
+  // That block is whatever Gmail's composer wrote or the user edited it into,
+  // so replacing it with the account default would discard a deliberate change.
+  const existingHtml = `<p>Hello</p><div class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}">Old Signature</div>`;
   const resolved = resolveBodyParts(
    { body: 'Hello', htmlBody: existingHtml, mimeType: 'text/html' },
    signature,
@@ -229,14 +266,15 @@ describe('Email signatures', () => {
   expect(resolved.html).not.toContain('<b>Jane Doe</b>');
  });
 
- it('does not duplicate signature when htmlBody already ends with raw signature HTML', () => {
-  const rawSigHtml = '<p>Hello</p>\n<p>-- <br><b>Jane Doe</b><br>Acme Corp</p>';
+ it('replaces a raw inlined copy of the signature HTML with one wrapped block', () => {
+  const rawSigHtml = `<p>Hello</p>\n${signature.html}`;
   const resolved = resolveBodyParts(
    { htmlBody: rawSigHtml, mimeType: 'text/html' },
    signature,
   );
 
-  expect(resolved.html).toBe(rawSigHtml);
+  expect(occurrences(resolved.html ?? '', 'Jane Doe')).toBe(1);
+  expect(resolved.html).toBe(`<p>Hello</p>\n<div><br></div>\n${wrapSignatureHtml(signature.html)}`);
  });
 
  it('appends text signature and emits no HTML part when mimeType is text/plain', () => {

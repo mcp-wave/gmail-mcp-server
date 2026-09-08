@@ -41,79 +41,87 @@ export interface ResolvedBody {
 }
 
 /**
- * Normalise a text or HTML block for tolerant suffix comparison.
- *
- * Replaces CRLF line endings with LF, strips trailing spaces from every
- * line, and trims leading and trailing whitespace from the whole string.
+ * Normalise a text block so a copy that has been through MIME is still
+ * recognisable: CRLF becomes LF and trailing whitespace comes off each line.
+ * Line endings survive a Gmail round trip changed, so a byte comparison
+ * against the stored signature would miss every copy it is meant to find.
  */
-function normalizeForComparison(str: string): string {
+function normalizeText(str: string): string {
  return str
-  .replace(/\r\n/g, '\n')
-  .replace(/\r/g, '\n')
+  .replace(/\r\n?/g, '\n')
   .split('\n')
   .map(line => line.replace(/[ \t]+$/, ''))
-  .join('\n')
-  .trim();
+  .join('\n');
 }
 
 /**
- * Append the text signature to an email body if not already present.
+ * Remove every copy of the signature from a text body.
  *
- * Drafts read back from Gmail via read_draft contain whatever signature was
- * previously appended. If an agent modifies that draft and calls update_draft,
- * an unconditional append would duplicate the signature on every save.
- * Comparing the normalised suffix guarantees idempotence across the
- * read-modify-write cycle.
+ * The cycle this exists for is draft_email, read_draft, update_draft: read_draft
+ * hands back a body with the signature already in it, and an agent that edits
+ * that body returns it with the signature somewhere in the middle rather than at
+ * the end. Checking only the end of the body misses it and appends a second
+ * copy, so every copy is removed wherever it sits and exactly one is put back.
+ *
+ * A body with no copy in it is returned untouched, so an unsigned message is
+ * never reflowed just by passing through here.
  */
+function stripTextSignature(body: string, signatureText: string): string {
+ const needle = normalizeText(signatureText).trim();
+ if (needle === '') return body;
+
+ const normalized = normalizeText(body);
+ if (!normalized.includes(needle)) return body;
+
+ return normalized
+  .split(needle)
+  .join('')
+  // Removing a copy leaves the blank line that separated it from the body.
+  .replace(/\n{3,}/g, '\n\n')
+  .replace(/\s+$/, '');
+}
+
+/** Append the signature to a text body, exactly once, at the end. */
 function appendTextSignature(body: string, signature?: SignatureParts | null): string {
- if (!signature || !signature.text) {
-  return body;
- }
+ if (!signature || !signature.text) return body;
 
- const normBody = normalizeForComparison(body);
- const normSig = normalizeForComparison(signature.text);
-
- if (normSig !== '' && normBody.endsWith(normSig)) {
-  return body;
- }
-
- if (body.trim() === '') {
-  return signature.text;
- }
-
- return `${body}\n\n${signature.text}`;
+ const stripped = stripTextSignature(body, signature.text);
+ if (stripped.trim() === '') return signature.text;
+ return `${stripped}\n\n${signature.text}`;
 }
 
 /**
- * Append the HTML signature to an email body if not already present.
+ * Append the signature to an HTML body, exactly once.
  *
- * Checks for the signature marker class first, which catches any message
- * previously signed by this server or composed in Gmail's web UI. A fallback
- * suffix check catches raw HTML signatures inlined without the wrapper.
+ * A body already carrying exactly one signature block is left alone. That block
+ * is whatever Gmail's web composer wrote, or whatever the user edited it into,
+ * and replacing it with the account default would discard a deliberate change
+ * the same way an unguarded draft edit would.
+ *
+ * With no block present, any raw inlined copy is removed first so a caller who
+ * pasted the signature markup into the body does not get a second one. More than
+ * one block means an earlier build doubled it, and the copies this server emits
+ * are removed exactly so one can be put back.
  */
 function appendHtmlSignature(html: string, signature?: SignatureParts | null): string {
- if (!signature || !signature.html) {
-  return html;
- }
+ if (!signature || !signature.html) return html;
 
- if (html.includes(SIGNATURE_MARKER)) {
-  return html;
- }
-
- const normHtml = normalizeForComparison(html);
- const normSig = normalizeForComparison(signature.html);
-
- if (normSig !== '' && normHtml.endsWith(normSig)) {
-  return html;
- }
+ const blocks = html.split(SIGNATURE_MARKER).length - 1;
+ // Two occurrences per block: the class and the data-smartmail attribute.
+ if (blocks === 2) return html;
 
  const wrapped = wrapSignatureHtml(signature.html);
- if (html.trim() === '') {
-  return wrapped;
- }
+ const stripped = html
+  .split(wrapped)
+  .join('')
+  .split(signature.html)
+  .join('')
+  .replace(/(?:\s*<div><br><\/div>)+\s*$/, '')
+  .replace(/\s+$/, '');
 
- // Intervening div provides the visual gap Gmail's composer emits between body and signature
- return `${html}\n<div><br></div>\n${wrapped}`;
+ if (stripped.trim() === '') return wrapped;
+ // The intervening div is the visual gap Gmail's own composer emits.
+ return `${stripped}\n<div><br></div>\n${wrapped}`;
 }
 
 /**
@@ -123,31 +131,36 @@ function appendHtmlSignature(html: string, signature?: SignatureParts | null): s
  * With no `mimeType`, the default is `multipart/alternative`: the raw Markdown
  * source as the text part and its rendered HTML as the HTML part.
  *
- * When an optional signature is provided, it is appended to the respective
- * parts before mimeType resolution.
+ * A signature is appended to whichever parts the message carries.
  */
 export function resolveBodyParts(
  args: { body?: string; htmlBody?: string; mimeType?: string },
  signature?: SignatureParts | null,
 ): ResolvedBody {
- const baseText = args.body ?? '';
+ const rawText = args.body ?? '';
+ // The HTML is rendered from the body with the signature taken out, because a
+ // body carrying the plain-text signature would otherwise render it into the
+ // HTML part as ordinary Markdown, where no signature block is there to be
+ // recognised and the real one gets appended underneath it.
+ const textForHtml = signature?.text ? stripTextSignature(rawText, signature.text) : rawText;
 
  if (args.mimeType === 'text/plain') {
-  return { mimeType: 'text/plain', text: appendTextSignature(baseText, signature) };
+  return { mimeType: 'text/plain', text: appendTextSignature(rawText, signature) };
  }
 
- const baseHtml = args.htmlBody ?? markdownToHtml(baseText);
+ const baseHtml = args.htmlBody ?? markdownToHtml(textForHtml);
 
  if (args.mimeType === 'text/html') {
   return { mimeType: 'text/html', html: appendHtmlSignature(baseHtml, signature) };
  }
 
  // Default (mimeType omitted, or 'multipart/alternative'): both parts.
- const text = appendTextSignature(baseText, signature);
+ const text = appendTextSignature(rawText, signature);
  const html = appendHtmlSignature(baseHtml, signature);
 
- // The mimeType decision happens after appending so an empty body with a
- // configured signature still gets an HTML part instead of collapsing to text/plain.
+ // A blank body with no htmlBody yields no HTML at all, so send a single plain
+ // part rather than a multipart message with an empty HTML half. The check runs
+ // after the append so a signature alone still earns an HTML part.
  if (html === '') {
   return { mimeType: 'text/plain', text };
  }
