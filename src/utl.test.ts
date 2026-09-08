@@ -21,6 +21,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createEmailMessage, resolveBodyParts } from './utl.js';
+import type { SignatureParts } from './signature.js';
+import { SIGNATURE_MARKER } from './signature.js';
 
 // Resolve src directory
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -162,6 +164,136 @@ describe('resolveBodyParts', () => {
   const resolved = resolveBodyParts({ body: '   ' });
 
   expect(resolved).toEqual({ mimeType: 'text/plain', text: '   ' });
+ });
+});
+describe('Email signatures', () => {
+ const signature: SignatureParts = {
+  text: '-- \nJane Doe\nAcme Corp',
+  html: '<p>-- <br><b>Jane Doe</b><br>Acme Corp</p>',
+ };
+
+ it('carries the signature in both text and HTML parts of a default multipart message', () => {
+  const raw = createEmailMessage(
+   { to: ['a@example.com'], subject: 'S', body: 'Hello world' },
+   signature,
+  );
+
+  expect(getHeader(raw, 'Content-Type')).toMatch(/^multipart\/alternative; boundary=/);
+  expect(raw).toContain('Content-Type: text/plain; charset=UTF-8');
+  expect(raw).toContain('Content-Type: text/html; charset=UTF-8');
+  expect(raw).toContain('Hello world\n\n-- \nJane Doe\nAcme Corp');
+  expect(raw).toContain(`<div class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}"><p>-- <br><b>Jane Doe</b><br>Acme Corp</p></div>`);
+  expect(raw).toContain('<div><br></div>');
+ });
+
+ it('omitting the signature argument produces exactly the unsigned message', () => {
+  // The multipart boundary is randomised per call, so it has to be normalised
+  // away before two builds of the same message can be compared.
+  const stripBoundary = (raw: string) => raw.replace(/----=_NextPart_[a-z0-9]+/g, 'BOUNDARY');
+  const args = { to: ['a@example.com'], subject: 'Test Subject', body: 'Hello world' };
+  const rawWithoutArg = createEmailMessage(args);
+  const rawWithNull = createEmailMessage(args, null);
+  const rawWithUndefined = createEmailMessage(args, undefined);
+
+  expect(rawWithoutArg).not.toContain(SIGNATURE_MARKER);
+  expect(rawWithoutArg).toContain('Hello world');
+  expect(rawWithoutArg).not.toContain('<div><br></div>');
+  expect(stripBoundary(rawWithNull)).toBe(stripBoundary(rawWithoutArg));
+  expect(stripBoundary(rawWithUndefined)).toBe(stripBoundary(rawWithoutArg));
+
+  const resolved = resolveBodyParts({ body: 'Hello world' });
+  expect(resolved.text).toBe('Hello world');
+  expect(resolved.html).not.toContain(SIGNATURE_MARKER);
+ });
+
+ it('does not sign twice when body already ends with the signature text', () => {
+  const bodyWithSig = 'Hello world\n\n-- \nJane Doe\nAcme Corp';
+  const resolved = resolveBodyParts({ body: bodyWithSig }, signature);
+
+  expect(resolved.text).toBe(bodyWithSig);
+
+  // Normalisation handles CRLF and trailing spaces
+  const bodyWithCrlfSig = 'Hello world\r\n\r\n--   \r\nJane Doe  \r\nAcme Corp\r\n';
+  const resolvedCrlf = resolveBodyParts({ body: bodyWithCrlfSig }, signature);
+  expect(resolvedCrlf.text).toBe(bodyWithCrlfSig);
+ });
+
+ it('leaves body HTML alone when it already contains a gmail_signature block', () => {
+  const existingHtml = `<p>Hello</p><div class="${SIGNATURE_MARKER}">Old Signature</div>`;
+  const resolved = resolveBodyParts(
+   { body: 'Hello', htmlBody: existingHtml, mimeType: 'text/html' },
+   signature,
+  );
+
+  expect(resolved.html).toBe(existingHtml);
+  expect(resolved.html).not.toContain('<b>Jane Doe</b>');
+ });
+
+ it('does not duplicate signature when htmlBody already ends with raw signature HTML', () => {
+  const rawSigHtml = '<p>Hello</p>\n<p>-- <br><b>Jane Doe</b><br>Acme Corp</p>';
+  const resolved = resolveBodyParts(
+   { htmlBody: rawSigHtml, mimeType: 'text/html' },
+   signature,
+  );
+
+  expect(resolved.html).toBe(rawSigHtml);
+ });
+
+ it('appends text signature and emits no HTML part when mimeType is text/plain', () => {
+  const resolved = resolveBodyParts({ body: 'Hello', mimeType: 'text/plain' }, signature);
+
+  expect(resolved.mimeType).toBe('text/plain');
+  expect(resolved.text).toBe('Hello\n\n-- \nJane Doe\nAcme Corp');
+  expect(resolved.html).toBeUndefined();
+
+  const raw = createEmailMessage({ to: ['a@example.com'], subject: 'S', body: 'Hello', mimeType: 'text/plain' }, signature);
+  expect(getHeader(raw, 'Content-Type')).toBe('text/plain; charset=UTF-8');
+  expect(raw).not.toContain('text/html');
+  expect(raw).not.toContain(SIGNATURE_MARKER);
+  expect(raw).toContain('Hello\n\n-- \nJane Doe\nAcme Corp');
+ });
+
+ it('appends signature to hand-authored htmlBody when mimeType is text/html', () => {
+  const handAuthoredHtml = '<h1>Custom Header</h1><p>Custom content</p>';
+  const resolved = resolveBodyParts(
+   { htmlBody: handAuthoredHtml, mimeType: 'text/html' },
+   signature,
+  );
+
+  expect(resolved.mimeType).toBe('text/html');
+  expect(resolved.text).toBeUndefined();
+  expect(resolved.html).toBe(
+   `${handAuthoredHtml}\n<div><br></div>\n<div class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}">${signature.html}</div>`,
+  );
+ });
+
+ it('yields both parts for an empty body with signature rather than collapsing to text/plain', () => {
+  const resolved = resolveBodyParts({ body: '' }, signature);
+
+  expect(resolved.mimeType).toBe('multipart/alternative');
+  expect(resolved.text).toBe(signature.text);
+  expect(resolved.html).toBe(
+   `<div class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}">${signature.html}</div>`,
+  );
+
+  const raw = createEmailMessage({ to: ['a@example.com'], subject: 'S', body: '' }, signature);
+  expect(getHeader(raw, 'Content-Type')).toMatch(/^multipart\/alternative; boundary=/);
+  expect(raw).toContain('Content-Type: text/plain; charset=UTF-8');
+  expect(raw).toContain('Content-Type: text/html; charset=UTF-8');
+ });
+
+ it('changes nothing when signature parts are empty strings', () => {
+  const emptySignature: SignatureParts = { text: '', html: '' };
+  const baseArgs = { body: 'Hello world' };
+  const resolved = resolveBodyParts(baseArgs, emptySignature);
+  const unsigned = resolveBodyParts(baseArgs);
+
+  expect(resolved).toEqual(unsigned);
+
+  const rawEmpty = createEmailMessage({ to: ['a@example.com'], subject: 'S', body: 'Hello world' }, emptySignature);
+  const rawUnsigned = createEmailMessage({ to: ['a@example.com'], subject: 'S', body: 'Hello world' });
+  const stripBoundary = (s: string) => s.replace(/----=_NextPart_[a-z0-9]+/g, 'BOUNDARY');
+  expect(stripBoundary(rawEmpty)).toBe(stripBoundary(rawUnsigned));
  });
 });
 

@@ -14,6 +14,7 @@ export const SendEmailSchema = z.object({
   threadId: z.string().optional().describe("Thread ID to reply to"),
   inReplyTo: z.string().optional().describe("Message ID being replied to"),
   attachments: z.array(z.string()).optional().describe("List of file paths to attach to the email"),
+  includeSignature: z.boolean().optional().default(true).describe("Whether to append the Gmail signature configured for the sending address. Defaults to true. Set false when the body already carries a signature or none is wanted. Appending is idempotent: a body that already ends with the signature, or already carries a gmail_signature block, is left untouched."),
 });
 
 export const ReadEmailSchema = z.object({
@@ -68,6 +69,7 @@ export const UpdateDraftSchema = z.object({
   inReplyTo: z.string().optional().describe("Message ID being replied to"),
   attachments: z.array(z.string()).optional().describe("File paths to attach, replacing the draft's current attachments. An edit to a draft that already has attachments must either re-supply them here or set dropAttachments, because Gmail holds the bytes and they cannot be rebuilt from the draft."),
   dropAttachments: z.boolean().optional().describe("Deliberately remove the draft's existing attachments. Only needed when the draft has attachments and you are not re-supplying them."),
+  includeSignature: z.boolean().optional().default(true).describe("Whether to append the Gmail signature configured for the sending address. Defaults to true. Set false when the body already carries a signature or none is wanted. Appending is idempotent: keeping the draft's existing body does not add a second copy, and a body already ending with the signature or carrying a gmail_signature block is left untouched."),
 });
 
 export const ListEmailLabelsSchema = z.object({}).describe("Retrieves all available Gmail labels");
@@ -212,6 +214,7 @@ export const ReplyAllSchema = z.object({
   htmlBody: z.string().optional().describe("Explicit HTML body. Overrides the HTML rendered from the Markdown body; only needed for hand-authored HTML."),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().describe("Override the content type. Omit for the default multipart/alternative (Markdown-rendered HTML plus plain text). Use 'text/plain' only when a plain-text-only message is explicitly required."),
   attachments: z.array(z.string()).optional().describe("List of file paths to attach to the reply"),
+  includeSignature: z.boolean().optional().default(true).describe("Whether to append the Gmail signature configured for the sending address. Defaults to true. Set false when the body already carries a signature or none is wanted. Appending is idempotent: a body that already ends with the signature, or already carries a gmail_signature block, is left untouched."),
   from: z.string().optional().describe("Send the reply as this address (must be a configured send-as alias in Gmail settings). Defaults to the account's default send-as address. Use list_send_as to discover available aliases."),
 });
 
@@ -336,14 +339,14 @@ export const toolDefinitions: ToolDefinition[] = [
   // Email write operations
   {
     name: "send_email",
-    description: "Sends a new email. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
+    description: "Sends a new email. The body is Markdown and is sent as HTML (multipart/alternative) by default, and the sender's configured Gmail signature is appended unless opted out.",
     schema: SendEmailSchema,
     scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
     annotations: { title: "Send Email", destructiveHint: false },
   },
   {
     name: "draft_email",
-    description: "Draft a new email. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
+    description: "Draft a new email. The body is Markdown and is sent as HTML (multipart/alternative) by default, and the sender's configured Gmail signature is appended unless opted out.",
     schema: SendEmailSchema,
     scopes: ["gmail.modify", "gmail.compose"],
     annotations: { title: "Draft Email", destructiveHint: false },
@@ -378,7 +381,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "update_draft",
-    description: "Revises an existing draft in place, keeping its ID. Requires the baseToken from read_draft: the draft is re-read at edit time and the edit refused if it changed since that read, so revisions cannot overwrite what the user wrote in Gmail. Fields you omit keep their current values, so changing only the subject leaves the body alone. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
+    description: "Revises an existing draft in place, keeping its ID. Requires the baseToken from read_draft: the draft is re-read at edit time and the edit refused if it changed since that read, so revisions cannot overwrite what the user wrote in Gmail. Fields you omit keep their current values, so changing only the subject leaves the body alone. The body is Markdown and is sent as HTML (multipart/alternative) by default, with the sender's configured Gmail signature appended unless opted out.",
     schema: UpdateDraftSchema,
     scopes: ["gmail.modify", "gmail.compose"],
     annotations: { title: "Update Draft", destructiveHint: false },
@@ -538,7 +541,7 @@ export const toolDefinitions: ToolDefinition[] = [
   // Reply-all operation
   {
     name: "reply_all",
-    description: "Replies to all recipients of an email. Automatically fetches the original email to build the recipient list (To, CC) and sets proper threading headers. The body is Markdown and is sent as HTML (multipart/alternative) by default.",
+    description: "Replies to all recipients of an email. Automatically fetches the original email to build the recipient list (To, CC) and sets proper threading headers. The body is Markdown and is sent as HTML (multipart/alternative) by default, and the sender's configured Gmail signature is appended unless opted out.",
     schema: ReplyAllSchema,
     scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
     annotations: { title: "Reply All", destructiveHint: false },
@@ -554,7 +557,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "set_signature",
-    description: "Sets the Gmail signature on a send-as address. The signature is Markdown and is rendered to HTML before saving. Note this is the signature Gmail appends when composing in the Gmail web UI; it is not added to mail sent through this server's send_email tool. Gmail sanitizes signature HTML, and the tool reports when what Gmail stored differs from what was sent.",
+    description: "Sets the Gmail signature on a send-as address. The signature is Markdown and is rendered to HTML before saving. This is the signature the server appends to outgoing mail by default, and it is also what Gmail's web composer uses. Gmail sanitizes signature HTML, and the tool reports when what Gmail stored differs from what was sent.",
     schema: SetSignatureSchema,
     scopes: ["gmail.settings.basic", "gmail.settings.sharing"],
     annotations: { title: "Set Signature", destructiveHint: false, idempotentHint: true },

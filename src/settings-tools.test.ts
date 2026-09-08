@@ -541,10 +541,6 @@ describe('settings tool definitions', () => {
    expect(hasScope(['gmail.readonly'], tool.scopes), name).toBe(false);
   }
  });
-
- it('warns in set_signature that the signature is not applied to sent mail', () => {
-  expect(getToolByName('set_signature')!.description).toMatch(/not added to mail sent through/i);
- });
 });
 
 /**

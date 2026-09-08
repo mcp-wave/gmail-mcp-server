@@ -3,6 +3,8 @@ import path from 'path';
 import { lookup as mimeLookup } from 'mime-types';
 import nodemailer from 'nodemailer';
 import { markdownToHtml } from './markdown.js';
+import type { SignatureParts } from './signature.js';
+import { wrapSignatureHtml, SIGNATURE_MARKER } from './signature.js';
 
 /**
  * Helper function to encode email headers containing non-ASCII characters
@@ -39,38 +41,123 @@ export interface ResolvedBody {
 }
 
 /**
+ * Normalise a text or HTML block for tolerant suffix comparison.
+ *
+ * Replaces CRLF line endings with LF, strips trailing spaces from every
+ * line, and trims leading and trailing whitespace from the whole string.
+ */
+function normalizeForComparison(str: string): string {
+ return str
+  .replace(/\r\n/g, '\n')
+  .replace(/\r/g, '\n')
+  .split('\n')
+  .map(line => line.replace(/[ \t]+$/, ''))
+  .join('\n')
+  .trim();
+}
+
+/**
+ * Append the text signature to an email body if not already present.
+ *
+ * Drafts read back from Gmail via read_draft contain whatever signature was
+ * previously appended. If an agent modifies that draft and calls update_draft,
+ * an unconditional append would duplicate the signature on every save.
+ * Comparing the normalised suffix guarantees idempotence across the
+ * read-modify-write cycle.
+ */
+function appendTextSignature(body: string, signature?: SignatureParts | null): string {
+ if (!signature || !signature.text) {
+  return body;
+ }
+
+ const normBody = normalizeForComparison(body);
+ const normSig = normalizeForComparison(signature.text);
+
+ if (normSig !== '' && normBody.endsWith(normSig)) {
+  return body;
+ }
+
+ if (body.trim() === '') {
+  return signature.text;
+ }
+
+ return `${body}\n\n${signature.text}`;
+}
+
+/**
+ * Append the HTML signature to an email body if not already present.
+ *
+ * Checks for the signature marker class first, which catches any message
+ * previously signed by this server or composed in Gmail's web UI. A fallback
+ * suffix check catches raw HTML signatures inlined without the wrapper.
+ */
+function appendHtmlSignature(html: string, signature?: SignatureParts | null): string {
+ if (!signature || !signature.html) {
+  return html;
+ }
+
+ if (html.includes(SIGNATURE_MARKER)) {
+  return html;
+ }
+
+ const normHtml = normalizeForComparison(html);
+ const normSig = normalizeForComparison(signature.html);
+
+ if (normSig !== '' && normHtml.endsWith(normSig)) {
+  return html;
+ }
+
+ const wrapped = wrapSignatureHtml(signature.html);
+ if (html.trim() === '') {
+  return wrapped;
+ }
+
+ // Intervening div provides the visual gap Gmail's composer emits between body and signature
+ return `${html}\n<div><br></div>\n${wrapped}`;
+}
+
+/**
  * Resolve the body parts of a message from the caller's `body` (Markdown),
  * optional `htmlBody` (verbatim HTML) and optional `mimeType` override.
  *
  * With no `mimeType`, the default is `multipart/alternative`: the raw Markdown
  * source as the text part and its rendered HTML as the HTML part.
+ *
+ * When an optional signature is provided, it is appended to the respective
+ * parts before mimeType resolution.
  */
-export function resolveBodyParts(args: { body?: string; htmlBody?: string; mimeType?: string }): ResolvedBody {
- const text = args.body ?? '';
+export function resolveBodyParts(
+ args: { body?: string; htmlBody?: string; mimeType?: string },
+ signature?: SignatureParts | null,
+): ResolvedBody {
+ const baseText = args.body ?? '';
 
  if (args.mimeType === 'text/plain') {
-  return { mimeType: 'text/plain', text };
+  return { mimeType: 'text/plain', text: appendTextSignature(baseText, signature) };
  }
 
- const html = args.htmlBody ?? markdownToHtml(text);
+ const baseHtml = args.htmlBody ?? markdownToHtml(baseText);
 
  if (args.mimeType === 'text/html') {
-  return { mimeType: 'text/html', html };
+  return { mimeType: 'text/html', html: appendHtmlSignature(baseHtml, signature) };
  }
 
  // Default (mimeType omitted, or 'multipart/alternative'): both parts.
- // A blank body with no htmlBody yields no HTML at all -- send a single plain part
- // rather than a multipart message with an empty HTML half.
+ const text = appendTextSignature(baseText, signature);
+ const html = appendHtmlSignature(baseHtml, signature);
+
+ // The mimeType decision happens after appending so an empty body with a
+ // configured signature still gets an HTML part instead of collapsing to text/plain.
  if (html === '') {
   return { mimeType: 'text/plain', text };
  }
  return { mimeType: 'multipart/alternative', text, html };
 }
 
-export function createEmailMessage(validatedArgs: any): string {
+export function createEmailMessage(validatedArgs: any, signature?: SignatureParts | null): string {
  const encodedSubject = encodeEmailHeader(sanitizeHeaderValue(validatedArgs.subject));
  // Resolve the body parts: Markdown-rendered HTML by default (see resolveBodyParts)
- const resolved = resolveBodyParts(validatedArgs);
+ const resolved = resolveBodyParts(validatedArgs, signature);
  const mimeType = resolved.mimeType;
 
  // Generate a random boundary string for multipart messages
@@ -147,7 +234,7 @@ export function createEmailMessage(validatedArgs: any): string {
 }
 
 
-export async function createEmailWithNodemailer(validatedArgs: any): Promise<string> {
+export async function createEmailWithNodemailer(validatedArgs: any, signature?: SignatureParts | null): Promise<string> {
  // Validate email addresses
  (validatedArgs.to as string[]).forEach(email => {
   if (!validateEmail(email)) {
@@ -180,7 +267,7 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
  // Resolve the body parts: Markdown-rendered HTML by default (see resolveBodyParts).
  // nodemailer omits a part entirely when its field is undefined, which is how
  // text/plain-only and text/html-only stay single-part here.
- const resolved = resolveBodyParts(validatedArgs);
+ const resolved = resolveBodyParts(validatedArgs, signature);
 
  const mailOptions = {
   from: validatedArgs.from || 'me', // Gmail API uses default send-as if 'me', or specified alias
