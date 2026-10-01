@@ -1,5 +1,8 @@
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import { MAX_INLINE_BYTES } from "./download-content.js";
+
+const MAX_INLINE_MB = MAX_INLINE_BYTES / (1024 * 1024);
 
 /**
  * An attachment is either a path on the machine running this server, or the
@@ -185,14 +188,14 @@ export const CreateFilterFromTemplateSchema = z.object({
 
 export const DownloadAttachmentSchema = z.object({
  messageId: z.string().describe("ID of the email message containing the attachment"),
- attachmentId: z.string().describe("ID of the attachment to download"),
- filename: z.string().optional().describe("Filename to save the attachment as (if not provided, uses original filename)"),
- savePath: z.string().optional().describe("Directory path to save the attachment (defaults to current directory)"),
+ attachmentId: z.string().describe("ID of the attachment to download, from read_email or get_thread"),
+ filename: z.string().optional().describe("Local server only, with savePath: filename to save as. Defaults to the attachment's own filename."),
+ savePath: z.string().optional().describe("Local server only: write the file into this directory on this machine instead of returning its bytes."),
 });
 
 export const DownloadEmailSchema = z.object({
  messageId: z.string().describe("ID of the email message to download"),
- savePath: z.string().describe("Directory path to save the email file"),
+ savePath: z.string().optional().describe("Local server only: write the file into this directory on this machine instead of returning it."),
  format: z.enum(['json', 'eml', 'txt', 'html']).optional().default('json')
   .describe("Output format: json (structured data), eml (raw RFC822), txt (plain text), html (formatted HTML)"),
 });
@@ -284,6 +287,9 @@ export interface ToolDefinition {
  schema: z.ZodType<any>;
  scopes: string[]; // Any of these scopes grants access
  annotations: ToolAnnotations;
+ // Parameters that name a path on the machine running this server. Only the
+ // local stdio server advertises them; see PrincipalSession.localFilesystem.
+ localOnlyParams?: string[];
 }
 
 // Tool registry with scope requirements
@@ -305,8 +311,9 @@ export const toolDefinitions: ToolDefinition[] = [
  },
  {
   name: "download_attachment",
-  description: "Downloads an email attachment to a specified location",
+  description: `Returns an email attachment's bytes in the tool result: PNG, JPEG, GIF and WebP images as an image you can view, any other file as an embedded resource (base64 blob) with its MIME type. Also reports the filename, size in bytes, MIME type and account. Files over ${MAX_INLINE_MB} MB are refused rather than truncated.`,
   schema: DownloadAttachmentSchema,
+  localOnlyParams: ['filename', 'savePath'],
   scopes: ["gmail.readonly", "gmail.modify"],
   annotations: { title: "Download Attachment", readOnlyHint: true },
  },
@@ -342,8 +349,9 @@ export const toolDefinitions: ToolDefinition[] = [
  },
  {
   name: "download_email",
-  description: "Downloads an email to a file in various formats (json, eml, txt, html). Returns metadata only - useful for saving emails without consuming context.",
+  description: `Exports an email as json (structured data), eml (raw RFC822), txt or html and returns it in the tool result as an embedded resource, with the subject, sender, date and attachment list. Exports over ${MAX_INLINE_MB} MB are refused rather than truncated.`,
   schema: DownloadEmailSchema,
+  localOnlyParams: ['savePath'],
   scopes: ["gmail.readonly", "gmail.modify"],
   annotations: { title: "Download Email", readOnlyHint: true },
  },
@@ -591,13 +599,18 @@ export const toolDefinitions: ToolDefinition[] = [
 ];
 
 // Convert tool definitions to MCP tool format
-export function toMcpTools(tools: ToolDefinition[]) {
- return tools.map(tool => ({
-  name: tool.name,
-  description: tool.description,
-  inputSchema: zodToJsonSchema(tool.schema),
-  annotations: tool.annotations,
- }));
+export function toMcpTools(tools: ToolDefinition[], opts: { localFilesystem: boolean }) {
+ return tools.map(tool => {
+  const schema = !opts.localFilesystem && tool.localOnlyParams && tool.schema instanceof z.ZodObject
+   ? tool.schema.omit(Object.fromEntries(tool.localOnlyParams.map(p => [p, true])))
+   : tool.schema;
+  return {
+   name: tool.name,
+   description: tool.description,
+   inputSchema: zodToJsonSchema(schema),
+   annotations: tool.annotations,
+  };
+ });
 }
 
 // Get a tool definition by name

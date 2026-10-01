@@ -27,6 +27,7 @@ import { disallowedRecipients, emailAddressOf, isPublicEmailDomain, rejectedAllo
 import { readAllSettings, setSignature, updateSendAs, setVacationResponder, formatSettingsSnapshot } from "./settings-manager.js";
 import { buildDraftSnapshot, mergeDraftEdit, assertFresh, assertAttachmentsSafe, describeMerge, draftToken, StaleDraftError, type DraftSnapshot } from "./draft-manager.js";
 import { readLabels, partitionDraftsFromTrashable, draftTrashRefusal, findZombieDrafts, repairZombieDrafts, formatRepair } from "./draft-integrity.js";
+import { downloadAttachment, deliverEmailExport, type DeliveryContext } from "./download-content.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -656,6 +657,7 @@ async function main() {
   principalId: 'local',
   accounts: [{ sub: 'local', email: 'me', primary: true, scopeNames: authorizedScopes }],
   getClient: () => ({ gmail, authorizedScopes }),
+  localFilesystem: true,
  };
  const server = createMcpServer(() => stdioSession);
  const transport = new StdioServerTransport();
@@ -692,7 +694,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
   );
   // Advertise the `account` selector on every Gmail tool, then append the
   // account-management meta tools.
-  const gmailTools = toMcpTools(availableTools).map((t: any) => ({
+  const gmailTools = toMcpTools(availableTools, { localFilesystem: session.localFilesystem === true }).map((t: any) => ({
    ...t,
    inputSchema: {
     ...t.inputSchema,
@@ -710,6 +712,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
   gmail: ReturnType<typeof google.gmail>,
   authorizedScopes: string[],
   sendCtx: SendContext,
+  delivery: DeliveryContext,
   extra: any,
  ): Promise<any> {
   // Gate a send against the per-account policy. If recipients are blocked,
@@ -1076,11 +1079,6 @@ function createMcpServer(resolveSession: ResolveSession): Server {
      const { messageId, savePath, format } = validatedArgs;
 
      try {
-      // Ensure save directory exists
-      if (!fs.existsSync(savePath)) {
-       fs.mkdirSync(savePath, { recursive: true });
-      }
-
       // Always fetch full message for metadata (needed for attachments list)
       const fullResponse = await gmail.users.messages.get({
        userId: "me",
@@ -1091,57 +1089,35 @@ function createMcpServer(resolveSession: ResolveSession): Server {
       const { subject, from, date } = extractHeaders(fullResponse.data.payload);
       const attachments = extractAttachments(fullResponse.data.payload as GmailMessagePart);
 
-      let content: string;
+      let bytes: Buffer;
 
       if (format === "eml") {
-       // For EML format, fetch raw RFC822 message
+       // Raw RFC 822 bytes, untouched: a message can carry 8-bit parts that
+       // are not valid UTF-8.
        const rawResponse = await gmail.users.messages.get({
         userId: "me",
         id: messageId,
         format: "raw",
        });
-       content = Buffer.from(rawResponse.data.raw || "", "base64url").toString("utf-8");
+       bytes = Buffer.from(rawResponse.data.raw || "", "base64url");
       } else {
-       // Extract email content for json/txt/html
        const emailContent = extractEmailContent(fullResponse.data.payload as GmailMessagePart || {});
-
+       let text: string;
        if (format === "json") {
-        const jsonData = gmailMessageToJson(fullResponse.data, emailContent, attachments);
-        content = JSON.stringify(jsonData, null, 2);
+        text = JSON.stringify(gmailMessageToJson(fullResponse.data, emailContent, attachments), null, 2);
        } else if (format === "txt") {
-        content = emailToTxt(fullResponse.data, emailContent, attachments);
+        text = emailToTxt(fullResponse.data, emailContent, attachments);
        } else {
-        // html - just return the raw HTML content
-        content = emailToHtml(emailContent);
+        text = emailToHtml(emailContent);
        }
+       bytes = Buffer.from(text, "utf-8");
       }
 
-      // Write file
-      const filename = `${messageId}.${format}`;
-      const fullPath = path.join(savePath, filename);
-      fs.writeFileSync(fullPath, content, "utf-8");
-      const stats = fs.statSync(fullPath);
-
-      // Return metadata with attachments
-      const result = {
-       status: "saved",
-       path: fullPath,
-       size: stats.size,
-       messageId,
-       subject,
-       from,
-       date,
-       attachments,
-      };
-
-      return {
-       content: [
-        {
-         type: "text",
-         text: JSON.stringify(result, null, 2),
-        },
-       ],
-      };
+      return deliverEmailExport(
+       { messageId, format, bytes, metadata: { messageId, subject, from, date, attachments } },
+       delivery,
+       savePath,
+      );
      } catch (error: any) {
       return {
        content: [
@@ -1150,6 +1126,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
          text: `Failed to download email: ${error.message}`,
         },
        ],
+       isError: true,
       };
      }
     }
@@ -1979,86 +1956,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
     }
     case "download_attachment": {
      const validatedArgs = DownloadAttachmentSchema.parse(args);
-
-     try {
-      // Get the attachment data from Gmail API
-      const attachmentResponse = await gmail.users.messages.attachments.get({
-       userId: 'me',
-       messageId: validatedArgs.messageId,
-       id: validatedArgs.attachmentId,
-      });
-
-      if (!attachmentResponse.data.data) {
-       throw new Error('No attachment data received');
-      }
-
-      // Decode the base64 data
-      const data = attachmentResponse.data.data;
-      const buffer = Buffer.from(data, 'base64url');
-
-      // Determine save path and filename
-      const savePath = validatedArgs.savePath || process.cwd();
-      let filename = validatedArgs.filename;
-
-      if (!filename) {
-       // Get original filename from message if not provided
-       const messageResponse = await gmail.users.messages.get({
-        userId: 'me',
-        id: validatedArgs.messageId,
-        format: 'full',
-       });
-
-       // Find the attachment part to get original filename
-       const findAttachment = (part: any): string | null => {
-        if (part.body && part.body.attachmentId === validatedArgs.attachmentId) {
-         return part.filename || `attachment-${validatedArgs.attachmentId}`;
-        }
-        if (part.parts) {
-         for (const subpart of part.parts) {
-          const found = findAttachment(subpart);
-          if (found) return found;
-         }
-        }
-        return null;
-       };
-
-       filename = findAttachment(messageResponse.data.payload) || `attachment-${validatedArgs.attachmentId}`;
-      }
-
-      // Sanitize filename to prevent path traversal
-      filename = path.basename(filename);
-
-      // Ensure save directory exists
-      if (!fs.existsSync(savePath)) {
-       fs.mkdirSync(savePath, { recursive: true });
-      }
-
-      // Resolve and validate final path stays within savePath
-      const resolvedSavePath = path.resolve(savePath);
-      const fullPath = path.resolve(resolvedSavePath, filename);
-      if (!fullPath.startsWith(resolvedSavePath + path.sep) && fullPath !== resolvedSavePath) {
-       throw new Error('Invalid filename: path traversal detected');
-      }
-      fs.writeFileSync(fullPath, buffer);
-
-      return {
-       content: [
-        {
-         type: "text",
-         text: `Attachment downloaded successfully:\nFile: ${filename}\nSize: ${buffer.length} bytes\nSaved to: ${fullPath}`,
-        },
-       ],
-      };
-     } catch (error: any) {
-      return {
-       content: [
-        {
-         type: "text",
-         text: `Failed to download attachment: ${error.message}`,
-        },
-       ],
-      };
-     }
+     return downloadAttachment(gmail, validatedArgs, delivery);
     }
 
     case "get_thread": {
@@ -2502,6 +2400,17 @@ function createMcpServer(resolveSession: ResolveSession): Server {
    return errText(`Error: Tool "${name}" is not available. You may need to re-authenticate with additional scopes.`);
   }
 
+  // A path names a file on the machine running this server. For the local
+  // stdio server that is the caller's own disk; for the hosted server it is the
+  // instance's, secrets included, so a path would let any caller mail its files
+  // to themselves.
+  if (!session.localFilesystem && Array.isArray(args.attachments) && args.attachments.some((a: unknown) => typeof a === 'string')) {
+   return errText(
+    'Error: file-path attachments are not accepted by the hosted server, which has no access to your files. ' +
+    'Supply each attachment inline as {"filename": ..., "content": <base64>, "mimeType"?: ...}.',
+   );
+  }
+
   const sendCtx = (a: Account): SendContext => ({
    ownEmail: a.email,
    policy: a.sendPolicy,
@@ -2521,6 +2430,10 @@ function createMcpServer(resolveSession: ResolveSession): Server {
     ? () => session.handleInvalidGrant!(a.sub)
     : undefined,
   });
+  const delivery = (a: Account): DeliveryContext => ({
+   account: a.email,
+   localFilesystem: session.localFilesystem === true,
+  });
 
   const accounts = session.accounts;
   const multi = accounts.length > 1;
@@ -2539,7 +2452,7 @@ function createMcpServer(resolveSession: ResolveSession): Server {
     );
    }
    const { gmail, authorizedScopes } = session.getClient(target.sub);
-   const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(target), extra);
+   const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(target), delivery(target), extra);
    return multi ? annotate(target.email, target.primary, result) : result;
   }
 
@@ -2557,13 +2470,13 @@ function createMcpServer(resolveSession: ResolveSession): Server {
 
   if (!multi) {
    const { gmail, authorizedScopes } = session.getClient(targets[0].sub);
-   return executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(targets[0]), extra);
+   return executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(targets[0]), delivery(targets[0]), extra);
   }
 
   const content: any[] = [];
   for (const acct of targets) {
    const { gmail, authorizedScopes } = session.getClient(acct.sub);
-   const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(acct), extra);
+   const result = await executeTool(name, toolArgs, gmail, authorizedScopes, sendCtx(acct), delivery(acct), extra);
    content.push({ type: 'text', text: `=== ${acct.email}${acct.primary ? ' (primary)' : ''} ===` });
    for (const c of result?.content || []) content.push(c);
   }
