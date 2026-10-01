@@ -27,7 +27,7 @@ import { disallowedRecipients, emailAddressOf, isPublicEmailDomain, rejectedAllo
 import { readAllSettings, setSignature, updateSendAs, setVacationResponder, formatSettingsSnapshot } from "./settings-manager.js";
 import { buildDraftSnapshot, mergeDraftEdit, assertFresh, assertAttachmentsSafe, describeMerge, draftToken, StaleDraftError, type DraftSnapshot } from "./draft-manager.js";
 import { readLabels, partitionDraftsFromTrashable, draftTrashRefusal, findZombieDrafts, repairZombieDrafts, formatRepair } from "./draft-integrity.js";
-import { downloadAttachment, deliverEmailExport, type DeliveryContext } from "./download-content.js";
+import { downloadAttachment, deliverEmailExport, withInlineBudget, MAX_INLINE_BYTES, type DeliveryContext } from "./download-content.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1089,32 +1089,44 @@ function createMcpServer(resolveSession: ResolveSession): Server {
       const { subject, from, date } = extractHeaders(fullResponse.data.payload);
       const attachments = extractAttachments(fullResponse.data.payload as GmailMessagePart);
 
-      let bytes: Buffer;
+      const metadata = { messageId, subject, from, date, attachments };
 
       if (format === "eml") {
-       // Raw RFC 822 bytes, untouched: a message can carry 8-bit parts that
-       // are not valid UTF-8.
-       const rawResponse = await gmail.users.messages.get({
-        userId: "me",
-        id: messageId,
-        format: "raw",
-       });
-       bytes = Buffer.from(rawResponse.data.raw || "", "base64url");
-      } else {
-       const emailContent = extractEmailContent(fullResponse.data.payload as GmailMessagePart || {});
-       let text: string;
-       if (format === "json") {
-        text = JSON.stringify(gmailMessageToJson(fullResponse.data, emailContent, attachments), null, 2);
-       } else if (format === "txt") {
-        text = emailToTxt(fullResponse.data, emailContent, attachments);
-       } else {
-        text = emailToHtml(emailContent);
+       // The raw message carries every attachment, so it can be large: refuse
+       // it before downloading when Gmail's estimate is already over the
+       // limit, and hold the inline budget while it is in memory.
+       const estimate = fullResponse.data.sizeEstimate ?? 0;
+       const inline = !(delivery.localFilesystem && savePath);
+       if (inline && estimate > MAX_INLINE_BYTES) {
+        return errText(
+         `Email ${messageId}.eml is about ${estimate} bytes, over the ${MAX_INLINE_BYTES}-byte limit for files this server returns inline. It was not returned.`,
+        );
        }
-       bytes = Buffer.from(text, "utf-8");
+       const exportRaw = async () => {
+        const rawResponse = await gmail.users.messages.get({
+         userId: "me",
+         id: messageId,
+         format: "raw",
+        });
+        // Raw RFC 822 bytes, untouched: a message can carry 8-bit parts
+        // that are not valid UTF-8.
+        const bytes = Buffer.from(rawResponse.data.raw || "", "base64url");
+        return deliverEmailExport({ messageId, format, bytes, metadata }, delivery, savePath);
+       };
+       return inline ? await withInlineBudget(estimate, exportRaw) : await exportRaw();
       }
 
+      const emailContent = extractEmailContent(fullResponse.data.payload as GmailMessagePart || {});
+      let text: string;
+      if (format === "json") {
+       text = JSON.stringify(gmailMessageToJson(fullResponse.data, emailContent, attachments), null, 2);
+      } else if (format === "txt") {
+       text = emailToTxt(fullResponse.data, emailContent, attachments);
+      } else {
+       text = emailToHtml(emailContent);
+      }
       return deliverEmailExport(
-       { messageId, format, bytes, metadata: { messageId, subject, from, date, attachments } },
+       { messageId, format, bytes: Buffer.from(text, "utf-8"), metadata },
        delivery,
        savePath,
       );

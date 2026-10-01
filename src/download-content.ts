@@ -14,14 +14,44 @@ import type { GmailClient } from './session.js';
 /**
  * Largest file returned inline, in bytes (before base64).
  *
- * Measured, not assumed: the deployed service answers over a chunked
+ * Measured, not assumed. The deployed service answers over a chunked
  * text/event-stream, so Cloud Run's 32 MiB cap on non-streamed HTTP/1
- * responses does not apply. What binds is the 512 MiB instance: serving a file
+ * responses does not apply. What binds is the 512 MiB instance: one request
  * holds Gmail's base64url text, the decoded bytes, the base64 copy and the
- * serialized JSON-RPC frame at once. See README "Downloading attachments and
- * emails" for the measurement.
+ * serialized JSON-RPC frame at once, roughly ten times the file. At the
+ * production baseline (~215 MiB) one 30 MiB file peaked at 510 MiB, two
+ * concurrent 20 MiB files at 483 MiB, and two concurrent 25 MiB files got the
+ * container OOM-killed. See README "Downloading attachments and emails".
  */
-export const MAX_INLINE_BYTES = 25 * 1024 * 1024;
+export const MAX_INLINE_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Decoded bytes that may be in flight across all inline deliveries on one
+ * instance. A request that would exceed it waits for earlier ones to finish
+ * instead of taking the instance, and every other caller's requests, down.
+ */
+export const INLINE_BUDGET_BYTES = 2 * MAX_INLINE_BYTES;
+
+let inFlightBytes = 0;
+const budgetWaiters: Array<() => void> = [];
+
+/**
+ * Reserve `bytes` of the inline budget, waiting while it is spent. Returns the
+ * release. The release runs on a later macrotask so the reservation also covers
+ * the SDK serializing the result and writing it to the socket, which happens
+ * after the tool handler returns.
+ */
+async function reserveInlineBudget(bytes: number): Promise<() => void> {
+ const amount = Math.min(bytes, INLINE_BUDGET_BYTES);
+ while (inFlightBytes > 0 && inFlightBytes + amount > INLINE_BUDGET_BYTES) {
+  await new Promise<void>(resolve => budgetWaiters.push(resolve));
+ }
+ inFlightBytes += amount;
+ return () => setImmediate(() => {
+  inFlightBytes -= amount;
+  for (const wake of budgetWaiters.splice(0)) wake();
+ });
+}
 
 /**
  * Raster formats that MCP clients render as images. Anything else under
@@ -125,25 +155,21 @@ async function fetchAttachmentBytes(gmail: GmailClient, messageId: string, attac
  * matches the downloaded bytes, and when several parts share that size the
  * bytes themselves decide.
  */
-export async function locateAttachmentPart(
- gmail: GmailClient,
- messageId: string,
+export async function matchAttachmentPart(
+ parts: AttachmentPart[],
  attachmentId: string,
  bytes: Buffer,
+ fetchBytes: (attachmentId: string) => Promise<Buffer>,
 ): Promise<AttachmentPart> {
- const message = await gmail.users.messages.get({ userId: 'me', id: messageId, format: 'full' });
- const parts = listAttachmentParts(message.data?.payload);
-
  const exact = parts.find(p => p.attachmentId === attachmentId);
  if (exact) return exact;
 
  const sameSize = parts.filter(p => p.size === bytes.length);
  if (sameSize.length === 1) return sameSize[0];
  for (const candidate of sameSize) {
-  const candidateBytes = await fetchAttachmentBytes(gmail, messageId, candidate.attachmentId);
-  if (candidateBytes.equals(bytes)) return candidate;
+  if ((await fetchBytes(candidate.attachmentId)).equals(bytes)) return candidate;
  }
- throw new Error(`Attachment ${attachmentId} does not belong to any part of message ${messageId}`);
+ throw new Error(`Attachment ${attachmentId} does not belong to any part of the message`);
 }
 
 function attachmentUri(account: string, messageId: string, part: AttachmentPart): string {
@@ -183,18 +209,60 @@ export async function downloadAttachment(
  args: DownloadAttachmentArgs,
  ctx: DeliveryContext,
 ): Promise<ToolResult> {
+ const inline = !(ctx.localFilesystem && args.savePath);
+ let parts: AttachmentPart[];
+ try {
+  const message = await gmail.users.messages.get({ userId: 'me', id: args.messageId, format: 'full' });
+  parts = listAttachmentParts(message.data?.payload);
+ } catch (error) {
+  return errorResult(`Failed to download attachment: ${messageOf(error)}`);
+ }
+ if (parts.length === 0) return errorResult(`Failed to download attachment: message ${args.messageId} has no attachments`);
+
+ // Refuse an oversize file before pulling it into memory: the exact part's
+ // size when the id still matches, otherwise the smallest part bounds it.
+ const exact = parts.find(p => p.attachmentId === args.attachmentId);
+ const sizes = parts.map(p => p.size);
+ const lowerBound = exact ? exact.size : Math.min(...sizes);
+ if (inline && lowerBound > MAX_INLINE_BYTES) {
+  return tooLarge(`Attachment "${exact ? exact.filename : args.attachmentId}"`, lowerBound);
+ }
+ if (!inline) return fetchAndDeliverAttachment(gmail, args, ctx, parts, false);
+
+ const upperBound = exact ? exact.size : Math.max(...sizes);
+ return withInlineBudget(upperBound, () => fetchAndDeliverAttachment(gmail, args, ctx, parts, true));
+}
+
+/** Run `deliver` holding `bytes` of the inline budget. */
+export async function withInlineBudget(bytes: number, deliver: () => Promise<ToolResult>): Promise<ToolResult> {
+ const release = await reserveInlineBudget(Math.min(bytes, MAX_INLINE_BYTES));
+ try {
+  return await deliver();
+ } finally {
+  release();
+ }
+}
+
+async function fetchAndDeliverAttachment(
+ gmail: GmailClient,
+ args: DownloadAttachmentArgs,
+ ctx: DeliveryContext,
+ parts: AttachmentPart[],
+ inline: boolean,
+): Promise<ToolResult> {
  let bytes: Buffer;
  let part: AttachmentPart;
  try {
   bytes = await fetchAttachmentBytes(gmail, args.messageId, args.attachmentId);
-  part = await locateAttachmentPart(gmail, args.messageId, args.attachmentId, bytes);
+  part = await matchAttachmentPart(parts, args.attachmentId, bytes,
+   id => fetchAttachmentBytes(gmail, args.messageId, id));
  } catch (error) {
   return errorResult(`Failed to download attachment: ${messageOf(error)}`);
  }
 
- if (ctx.localFilesystem && args.savePath) {
+ if (!inline) {
   try {
-   const fullPath = writeLocal(args.savePath, args.filename || part.filename, bytes);
+   const fullPath = writeLocal(args.savePath!, args.filename || part.filename, bytes);
    return {
     content: [{
      type: 'text',
