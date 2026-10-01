@@ -236,10 +236,10 @@ describe("DownloadEmailSchema", () => {
     ).toThrow();
   });
 
-  it("requires savePath", () => {
-    expect(() =>
-      DownloadEmailSchema.parse({ messageId: "msg123" })
-    ).toThrow();
+  it("does not require savePath; the export comes back in the tool result", () => {
+    const result = DownloadEmailSchema.parse({ messageId: "msg123" });
+    expect(result.messageId).toBe("msg123");
+    expect(result.savePath).toBeUndefined();
   });
 });
 
