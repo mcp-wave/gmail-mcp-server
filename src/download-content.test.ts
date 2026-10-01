@@ -13,6 +13,7 @@ import {
  MAX_INLINE_BYTES,
  downloadAttachment,
  deliverEmailExport,
+ withInlineBudget,
  type ToolResult,
  type ImageBlock,
  type TextBlock,
@@ -94,6 +95,17 @@ function resourceOf(result: ToolResult): ResourceBlock | null {
 
 function textOf(result: ToolResult): string {
  return result.content.filter(isText).map(b => b.text).join('\n');
+}
+
+/** A promise with its resolver, for gating a fake fetch mid-flight. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+ const { promise, resolve } = Promise.withResolvers<void>();
+ return { promise, resolve };
+}
+
+/** Let pending microtasks and one immediate callback run. */
+function flush(): Promise<void> {
+ return new Promise(r => setImmediate(r));
 }
 
 afterEach(() => {
@@ -282,16 +294,23 @@ describe('local mode writes into the requested directory', () => {
 });
 
 describe('oversize files are refused, not truncated', () => {
- it('MAX_INLINE_BYTES + 1 bytes is an error with no image or resource block', async () => {
-  const bytes = Buffer.alloc(MAX_INLINE_BYTES + 1, 0x61);
-  const payload = filePart({ filename: 'huge.bin', mimeType: 'application/octet-stream', attachmentId: 'att-huge', size: bytes.length });
-  const gmail = fakeGmail(payload, { 'att-huge': bytes });
+ it('MAX_INLINE_BYTES + 1 bytes is refused before any bytes are fetched', async () => {
+  const payload = filePart({
+   filename: 'huge.bin',
+   mimeType: 'application/octet-stream',
+   attachmentId: 'att-huge',
+   size: MAX_INLINE_BYTES + 1,
+  });
+  // No attachment data in the fake: a fetch attempt would throw, so reaching the
+  // size refusal at all proves it happened before fetching.
+  const gmail = fakeGmail(payload, {});
 
   const result = await downloadAttachment(gmail, { messageId: 'm1', attachmentId: 'att-huge' }, HOSTED);
 
   expect(result.isError).toBe(true);
   expect(attachmentOf(result)).toBeNull();
   expect(resourceOf(result)).toBeNull();
+  expect(gmail.users.messages.attachments.get).not.toHaveBeenCalled();
  });
 
  it('exactly MAX_INLINE_BYTES is still accepted', async () => {
@@ -305,6 +324,92 @@ describe('oversize files are refused, not truncated', () => {
   const block = resourceOf(result);
   expect(block).not.toBeNull();
   expect(Buffer.from((block!.resource as ResourcePayload).blob ?? '', 'base64').equals(bytes)).toBe(true);
+ });
+});
+
+describe('concurrent inline deliveries share a byte budget', () => {
+ it('a third download whose reservation would exceed the budget waits until an earlier one finishes', async () => {
+  // Two reservations of MAX_INLINE_BYTES fill the 2x budget exactly; the third must wait.
+  const size = MAX_INLINE_BYTES;
+  const bytesFor: Record<string, Buffer> = {
+   'id-1': Buffer.alloc(size, 0x11),
+   'id-2': Buffer.alloc(size, 0x22),
+   'id-3': Buffer.alloc(size, 0x33),
+  };
+  const payload: MessagePart = {
+   mimeType: 'multipart/mixed',
+   parts: [
+    filePart({ partId: '0', filename: 'one.bin', mimeType: 'application/x-one', attachmentId: 'id-1', size }),
+    filePart({ partId: '1', filename: 'two.bin', mimeType: 'application/x-two', attachmentId: 'id-2', size }),
+    filePart({ partId: '2', filename: 'three.bin', mimeType: 'application/x-three', attachmentId: 'id-3', size }),
+   ],
+  };
+
+  const firstFetchStarted = deferred();
+  const secondFetchStarted = deferred();
+  const releaseFirstFetch = deferred();
+  const releaseSecondFetch = deferred();
+  let firstReturned = false;
+  let thirdFetchedAfterFirstReturned = false;
+
+  const attachmentsGet = vi.fn(async ({ id }: { id: string }) => {
+   if (id === 'id-1') {
+    firstFetchStarted.resolve();
+    await releaseFirstFetch.promise;
+    firstReturned = true;
+    return { data: { data: bytesFor['id-1'].toString('base64url') } };
+   }
+   if (id === 'id-2') {
+    secondFetchStarted.resolve();
+    await releaseSecondFetch.promise;
+    return { data: { data: bytesFor['id-2'].toString('base64url') } };
+   }
+   if (id === 'id-3') thirdFetchedAfterFirstReturned = firstReturned;
+   return { data: { data: bytesFor[id].toString('base64url') } };
+  });
+  const gmail: FakeGmail = {
+   users: {
+    messages: { get: vi.fn(async () => ({ data: { payload } })), attachments: { get: attachmentsGet } },
+   },
+  };
+
+  const first = downloadAttachment(gmail, { messageId: 'm1', attachmentId: 'id-1' }, HOSTED);
+  await firstFetchStarted.promise;
+  const second = downloadAttachment(gmail, { messageId: 'm1', attachmentId: 'id-2' }, HOSTED);
+  await secondFetchStarted.promise;
+  const third = downloadAttachment(gmail, { messageId: 'm1', attachmentId: 'id-3' }, HOSTED);
+  await flush();
+
+  // The first two hold the whole budget; the third must not have fetched yet.
+  const thirdFetches = attachmentsGet.mock.calls.filter(c => c[0].id === 'id-3');
+  expect(thirdFetches).toHaveLength(0);
+
+  releaseFirstFetch.resolve();
+  // The release fires on setImmediate after the first result returns; wait until
+  // the third fetch has actually started rather than guessing the flush count.
+  for (let i = 0; i < 100 && !thirdFetchedAfterFirstReturned; i++) await flush();
+  expect(thirdFetchedAfterFirstReturned).toBe(true);
+
+  releaseSecondFetch.resolve();
+  const results = await Promise.all([first, second, third]);
+  for (const [result, id] of results.map((r, i) => [r, `id-${i + 1}`] as const)) {
+   expect(result.isError).toBeUndefined();
+   const blob = (resourceOf(result)!.resource as ResourcePayload).blob ?? '';
+   expect(Buffer.from(blob, 'base64').equals(bytesFor[id])).toBe(true);
+  }
+ });
+
+ it('withInlineBudget releases its reservation when deliver throws', async () => {
+  await expect(withInlineBudget(MAX_INLINE_BYTES, async () => {
+   throw new Error('boom');
+  })).rejects.toThrow('boom');
+
+  // If the failed delivery had leaked its reservation, this full-size
+  // reservation would wait forever and the test would time out.
+  const result = await withInlineBudget(MAX_INLINE_BYTES, async () => ({
+   content: [{ type: 'text', text: 'later reservation went through' }],
+  }));
+  expect(result.content[0].text).toBe('later reservation went through');
  });
 });
 
