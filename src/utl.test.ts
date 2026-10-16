@@ -7,10 +7,6 @@ import { createEmailMessage, createEmailWithNodemailer, resolveBodyParts } from 
 import type { SignatureParts } from './signature.js';
 import { SIGNATURE_MARKER, wrapSignatureHtml } from './signature.js';
 
-// Resolve src directory
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const srcDir = __dirname;
-
 // Helper: extract a header value from a raw MIME message string
 function getHeader(raw: string, headerName: string): string | null {
  const regex = new RegExp(`^${headerName}:\\s*(.+)$`, 'mi');
