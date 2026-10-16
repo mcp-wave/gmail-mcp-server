@@ -24,60 +24,62 @@
  * so the guard does not depend on resolving which one Gmail does.
  *
  * Attachments are the one thing that cannot be preserved: they live in Gmail,
- * and rebuilding the MIME body requires local file paths this server no longer
- * has. Rather than silently dropping them, an edit to a draft with attachments
- * is refused unless the caller re-supplies them or explicitly drops them.
+ * and rebuilding the MIME body needs the bytes, which this server does not
+ * retain between calls. Rather than silently dropping them, an edit to a draft
+ * with attachments is refused unless the caller re-supplies them (as a local
+ * path or inline base64) or explicitly drops them.
  */
 
 import type { gmail_v1 } from 'googleapis';
 import { parseEmailAddresses } from './email-export.js';
+import type { AttachmentInput } from './utl.js';
 
 /** Thrown when an edit would overwrite content the caller has not seen. */
 export class StaleDraftError extends Error {
-    readonly currentSnapshot: DraftSnapshot;
+ readonly currentSnapshot: DraftSnapshot;
 
-    constructor(message: string, currentSnapshot: DraftSnapshot) {
-        super(message);
-        this.name = 'StaleDraftError';
-        this.currentSnapshot = currentSnapshot;
-    }
+ constructor(message: string, currentSnapshot: DraftSnapshot) {
+  super(message);
+  this.name = 'StaleDraftError';
+  this.currentSnapshot = currentSnapshot;
+ }
 }
 
 export interface DraftAttachment {
-    filename: string;
-    mimeType: string;
-    size: number;
+ filename: string;
+ mimeType: string;
+ size: number;
 }
 
 /** The live state of a draft, as read immediately before an edit. */
 export interface DraftSnapshot {
-    draftId: string;
-    messageId: string;
-    historyId: string;
-    /** Opaque staleness token. Callers pass this back as `baseToken`. */
-    token: string;
-    to: string[];
-    cc: string[];
-    bcc: string[];
-    subject: string;
-    text: string;
-    html: string;
-    attachments: DraftAttachment[];
+ draftId: string;
+ messageId: string;
+ historyId: string;
+ /** Opaque staleness token. Callers pass this back as `baseToken`. */
+ token: string;
+ to: string[];
+ cc: string[];
+ bcc: string[];
+ subject: string;
+ text: string;
+ html: string;
+ attachments: DraftAttachment[];
 }
 
 /** Headers already extracted from the draft's payload by the caller. */
 export interface ExtractedHeaders {
-    subject: string;
-    to: string;
-    cc: string;
-    bcc: string;
+ subject: string;
+ to: string;
+ cc: string;
+ bcc: string;
 }
 
 export interface BuildSnapshotInput {
-    draft: gmail_v1.Schema$Draft;
-    headers: ExtractedHeaders;
-    content: { text: string; html: string };
-    attachments: DraftAttachment[];
+ draft: gmail_v1.Schema$Draft;
+ headers: ExtractedHeaders;
+ content: { text: string; html: string };
+ attachments: DraftAttachment[];
 }
 
 /**
@@ -90,7 +92,7 @@ export interface BuildSnapshotInput {
  * an older shape being mistaken for a current one.
  */
 export function draftToken(messageId?: string | null, historyId?: string | null): string {
-    return `v1:${messageId ?? ''}:${historyId ?? ''}`;
+ return `v1:${messageId ?? ''}:${historyId ?? ''}`;
 }
 
 /**
@@ -101,54 +103,54 @@ export function draftToken(messageId?: string | null, historyId?: string | null)
  * what determine delivery, so they are preserved and the display names are not.
  */
 export function headerToAddresses(header: string): string[] {
-    if (!header || !header.trim()) return [];
-    return parseEmailAddresses(header).map(a => a.email).filter(Boolean);
+ if (!header || !header.trim()) return [];
+ return parseEmailAddresses(header).map(a => a.email).filter(Boolean);
 }
 
 export function buildDraftSnapshot(input: BuildSnapshotInput): DraftSnapshot {
-    const { draft, headers, content, attachments } = input;
-    const message = draft.message ?? {};
+ const { draft, headers, content, attachments } = input;
+ const message = draft.message ?? {};
 
-    return {
-        draftId: draft.id ?? '',
-        messageId: message.id ?? '',
-        historyId: message.historyId ?? '',
-        token: draftToken(message.id, message.historyId),
-        to: headerToAddresses(headers.to),
-        cc: headerToAddresses(headers.cc),
-        bcc: headerToAddresses(headers.bcc),
-        subject: headers.subject ?? '',
-        text: content.text ?? '',
-        html: content.html ?? '',
-        attachments,
-    };
+ return {
+  draftId: draft.id ?? '',
+  messageId: message.id ?? '',
+  historyId: message.historyId ?? '',
+  token: draftToken(message.id, message.historyId),
+  to: headerToAddresses(headers.to),
+  cc: headerToAddresses(headers.cc),
+  bcc: headerToAddresses(headers.bcc),
+  subject: headers.subject ?? '',
+  text: content.text ?? '',
+  html: content.html ?? '',
+  attachments,
+ };
 }
 
 export interface DraftEditArgs {
-    to?: string[];
-    cc?: string[];
-    bcc?: string[];
-    subject?: string;
-    body?: string;
-    htmlBody?: string;
-    mimeType?: string;
-    from?: string;
-    threadId?: string;
-    inReplyTo?: string;
-    attachments?: string[];
-    /** Token from a prior read of this draft. Required. */
-    baseToken?: string;
-    /** Acknowledge that the draft's existing attachments should be discarded. */
-    dropAttachments?: boolean;
+ to?: string[];
+ cc?: string[];
+ bcc?: string[];
+ subject?: string;
+ body?: string;
+ htmlBody?: string;
+ mimeType?: string;
+ from?: string;
+ threadId?: string;
+ inReplyTo?: string;
+ attachments?: AttachmentInput[];
+ /** Token from a prior read of this draft. Required. */
+ baseToken?: string;
+ /** Acknowledge that the draft's existing attachments should be discarded. */
+ dropAttachments?: boolean;
 }
 
 export interface MergedDraftEdit {
-    /** Args for the message builders, with unsupplied fields filled from the live draft. */
-    messageArgs: Record<string, unknown>;
-    /** Fields taken from the live draft because the caller did not supply them. */
-    preserved: string[];
-    /** Fields the caller supplied, overwriting whatever the draft held. */
-    replaced: string[];
+ /** Args for the message builders, with unsupplied fields filled from the live draft. */
+ messageArgs: Record<string, unknown>;
+ /** Fields taken from the live draft because the caller did not supply them. */
+ preserved: string[];
+ /** Fields the caller supplied, overwriting whatever the draft held. */
+ replaced: string[];
 }
 
 /**
@@ -158,22 +160,22 @@ export interface MergedDraftEdit {
  * producing a message built on content the caller never read.
  */
 export function assertFresh(current: DraftSnapshot, baseToken?: string): void {
-    if (!baseToken) {
-        throw new StaleDraftError(
-            `Editing a draft requires the current content. Call read_draft on "${current.draftId}" first, ` +
-            `then pass its baseToken back. This exists so an edit cannot discard changes the user made in Gmail.`,
-            current,
-        );
-    }
+ if (!baseToken) {
+  throw new StaleDraftError(
+   `Editing a draft requires the current content. Call read_draft on "${current.draftId}" first, ` +
+   `then pass its baseToken back. This exists so an edit cannot discard changes the user made in Gmail.`,
+   current,
+  );
+ }
 
-    if (baseToken !== current.token) {
-        throw new StaleDraftError(
-            `This draft changed after you read it, so the edit was refused to avoid overwriting those changes. ` +
-            `You based the edit on "${baseToken}" but the draft is now at "${current.token}". ` +
-            `The draft's current content is included below: fold the user's changes into your edit and retry with the new baseToken.`,
-            current,
-        );
-    }
+ if (baseToken !== current.token) {
+  throw new StaleDraftError(
+   `This draft changed after you read it, so the edit was refused to avoid overwriting those changes. ` +
+   `You based the edit on "${baseToken}" but the draft is now at "${current.token}". ` +
+   `The draft's current content is included below: fold the user's changes into your edit and retry with the new baseToken.`,
+   current,
+  );
+ }
 }
 
 /**
@@ -185,58 +187,58 @@ export function assertFresh(current: DraftSnapshot, baseToken?: string): void {
  * multipart to single-part.
  */
 export function mergeDraftEdit(current: DraftSnapshot, args: DraftEditArgs): MergedDraftEdit {
-    const preserved: string[] = [];
-    const replaced: string[] = [];
+ const preserved: string[] = [];
+ const replaced: string[] = [];
 
-    const take = <T>(field: string, supplied: T | undefined, existing: T): T => {
-        if (supplied === undefined) {
-            preserved.push(field);
-            return existing;
-        }
-        replaced.push(field);
-        return supplied;
-    };
+ const take = <T>(field: string, supplied: T | undefined, existing: T): T => {
+  if (supplied === undefined) {
+   preserved.push(field);
+   return existing;
+  }
+  replaced.push(field);
+  return supplied;
+ };
 
-    const messageArgs: Record<string, unknown> = {
-        to: take('to', args.to, current.to),
-        subject: take('subject', args.subject, current.subject),
-    };
+ const messageArgs: Record<string, unknown> = {
+  to: take('to', args.to, current.to),
+  subject: take('subject', args.subject, current.subject),
+ };
 
-    const cc = take('cc', args.cc, current.cc);
-    if (cc.length > 0) messageArgs.cc = cc;
-    const bcc = take('bcc', args.bcc, current.bcc);
-    if (bcc.length > 0) messageArgs.bcc = bcc;
+ const cc = take('cc', args.cc, current.cc);
+ if (cc.length > 0) messageArgs.cc = cc;
+ const bcc = take('bcc', args.bcc, current.bcc);
+ if (bcc.length > 0) messageArgs.bcc = bcc;
 
-    // The body is a pair. Supplying either half replaces the body wholesale;
-    // supplying neither carries both halves over unchanged.
-    if (args.body === undefined && args.htmlBody === undefined) {
-        preserved.push('body');
-        messageArgs.body = current.text;
-        if (current.html) messageArgs.htmlBody = current.html;
-    } else {
-        replaced.push('body');
-        messageArgs.body = args.body ?? current.text;
-        if (args.htmlBody !== undefined) messageArgs.htmlBody = args.htmlBody;
-    }
+ // The body is a pair. Supplying either half replaces the body wholesale;
+ // supplying neither carries both halves over unchanged.
+ if (args.body === undefined && args.htmlBody === undefined) {
+  preserved.push('body');
+  messageArgs.body = current.text;
+  if (current.html) messageArgs.htmlBody = current.html;
+ } else {
+  replaced.push('body');
+  messageArgs.body = args.body ?? current.text;
+  if (args.htmlBody !== undefined) messageArgs.htmlBody = args.htmlBody;
+ }
 
-    if (args.mimeType !== undefined) messageArgs.mimeType = args.mimeType;
-    if (args.from !== undefined) messageArgs.from = args.from;
-    if (args.threadId !== undefined) messageArgs.threadId = args.threadId;
-    if (args.inReplyTo !== undefined) messageArgs.inReplyTo = args.inReplyTo;
-    if (args.attachments !== undefined) messageArgs.attachments = args.attachments;
+ if (args.mimeType !== undefined) messageArgs.mimeType = args.mimeType;
+ if (args.from !== undefined) messageArgs.from = args.from;
+ if (args.threadId !== undefined) messageArgs.threadId = args.threadId;
+ if (args.inReplyTo !== undefined) messageArgs.inReplyTo = args.inReplyTo;
+ if (args.attachments !== undefined) messageArgs.attachments = args.attachments;
 
-    if ((messageArgs.to as string[]).length === 0) {
-        throw new Error('The draft would be left with no recipients. Supply "to", or leave it out to keep the draft\'s existing recipients.');
-    }
+ if ((messageArgs.to as string[]).length === 0) {
+  throw new Error('The draft would be left with no recipients. Supply "to", or leave it out to keep the draft\'s existing recipients.');
+ }
 
-    return { messageArgs, preserved, replaced };
+ return { messageArgs, preserved, replaced };
 }
 
 /**
  * Refuse an edit that would silently discard the draft's attachments.
  *
- * Gmail holds the attachment bytes; rebuilding the message needs local file
- * paths, which this server does not retain between calls. So an edit either
+ * Gmail holds the attachment bytes; rebuilding the message needs them again,
+ * and this server does not retain them between calls. So an edit either
  * re-supplies them or says out loud that they should go.
  *
  * An empty array is not a re-supply. LLM clients routinely emit `[]` for an
@@ -245,22 +247,23 @@ export function mergeDraftEdit(current: DraftSnapshot, args: DraftEditArgs): Mer
  * Removing them always requires saying so.
  */
 export function assertAttachmentsSafe(current: DraftSnapshot, args: DraftEditArgs): void {
-    if (current.attachments.length === 0) return;
-    if (args.dropAttachments) return;
-    if (args.attachments !== undefined && args.attachments.length > 0) return;
+ if (current.attachments.length === 0) return;
+ if (args.dropAttachments) return;
+ if (args.attachments !== undefined && args.attachments.length > 0) return;
 
-    const names = current.attachments.map(a => a.filename).join(', ');
-    throw new Error(
-        `This draft has ${current.attachments.length} attachment(s) (${names}) that an edit cannot preserve: ` +
-        `Gmail holds the bytes and rebuilding the message needs local file paths. ` +
-        `Re-supply them with "attachments", or pass "dropAttachments": true to remove them deliberately.`,
-    );
+ const names = current.attachments.map(a => a.filename).join(', ');
+ throw new Error(
+  `This draft has ${current.attachments.length} attachment(s) (${names}) that an edit cannot preserve: ` +
+  `Gmail holds the bytes and rebuilding the message needs them again. ` +
+  `Re-supply them with "attachments" (inline base64, or a path on the machine running this server), ` +
+  `or pass "dropAttachments": true to remove them deliberately.`,
+ );
 }
 
 /** One-line summary of what an edit kept and what it overwrote. */
 export function describeMerge(merged: MergedDraftEdit): string {
-    const parts: string[] = [];
-    if (merged.replaced.length > 0) parts.push(`replaced ${merged.replaced.join(', ')}`);
-    if (merged.preserved.length > 0) parts.push(`kept the draft's existing ${merged.preserved.join(', ')}`);
-    return parts.join('; ') || 'no changes';
+ const parts: string[] = [];
+ if (merged.replaced.length > 0) parts.push(`replaced ${merged.replaced.join(', ')}`);
+ if (merged.preserved.length > 0) parts.push(`kept the draft's existing ${merged.preserved.join(', ')}`);
+ return parts.join('; ') || 'no changes';
 }
