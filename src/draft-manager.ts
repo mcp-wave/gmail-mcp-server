@@ -203,6 +203,16 @@ export function assertFresh(current: DraftSnapshot, baseToken?: string): void {
  * multipart to single-part.
  */
 export function mergeDraftEdit(current: DraftSnapshot, args: DraftEditArgs): MergedDraftEdit {
+ const threadChanged =
+  args.threadId !== undefined &&
+  args.threadId !== current.threadId;
+ if (threadChanged && !args.threadId.trim()) {
+  throw new Error('Changing a draft thread requires a nonblank "threadId".');
+ }
+ if (threadChanged && !args.inReplyTo?.trim()) {
+  throw new Error('Changing a draft thread requires an explicit nonblank "inReplyTo".');
+ }
+
  const preserved: string[] = [];
  const replaced: string[] = [];
 
@@ -246,15 +256,18 @@ export function mergeDraftEdit(current: DraftSnapshot, args: DraftEditArgs): Mer
  messageArgs.date = current.date;
  preserved.push('rfcMessageId', 'date');
 
- // A new reply target starts a new reference chain unless an internal caller
- // deliberately provides one. Carry the complete existing chain when no new
- // target was supplied, including when a caller repeats the current target.
+ // A new reply target or thread starts a new reference chain unless an internal
+ // caller deliberately provides one. A changed thread always starts at its
+ // supplied parent, even when that parent text matches the old thread's parent.
  const inReplyTo = take('inReplyTo', args.inReplyTo, current.inReplyTo);
  messageArgs.inReplyTo = inReplyTo;
  if (args.references !== undefined) {
   messageArgs.references = args.references;
   replaced.push('references');
- } else if (args.inReplyTo !== undefined && args.inReplyTo !== current.inReplyTo) {
+ } else if (
+  threadChanged ||
+  (args.inReplyTo !== undefined && args.inReplyTo !== current.inReplyTo)
+ ) {
   messageArgs.references = inReplyTo;
   replaced.push('references');
  } else {
