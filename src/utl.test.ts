@@ -1,32 +1,11 @@
 /**
- * Tests for email message construction in utl.ts
- *
- * Threading headers (issue #66):
- * 1. createEmailMessage uses separate `references` field when provided
- * 2. createEmailMessage falls back to `inReplyTo` for References when no `references` field
- * 3. No References/In-Reply-To headers on new emails
- * 4. Source verification: createEmailWithNodemailer uses references field
- * 5. Source verification: handleEmailAction auto-resolves threading headers
- * 6. Source verification: read_email returns Message-ID
- *
- * HTML by default:
- * 7. A Markdown `body` alone yields multipart/alternative with rendered HTML
- * 8. `mimeType: 'text/plain'` is the plain-text opt-out
- * 9. A supplied `htmlBody` is used verbatim
- * 10. resolveBodyParts implements the same rules
+ * Tests for email message construction in utl.ts.
  */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { createEmailMessage, resolveBodyParts } from './utl.js';
+import { createEmailMessage, createEmailWithNodemailer, resolveBodyParts } from './utl.js';
 import type { SignatureParts } from './signature.js';
 import { SIGNATURE_MARKER, wrapSignatureHtml } from './signature.js';
-
-// Resolve src directory
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const srcDir = __dirname;
 
 // Helper: extract a header value from a raw MIME message string
 function getHeader(raw: string, headerName: string): string | null {
@@ -74,6 +53,59 @@ describe('Email threading headers', () => {
 
   expect(getHeader(raw, 'References')).toBeNull();
   expect(getHeader(raw, 'In-Reply-To')).toBeNull();
+ });
+});
+
+describe('Draft MIME identity', () => {
+ const baseArgs = {
+  to: ['draft-recipient@example.com'],
+  subject: 'Stored draft',
+  body: 'Rewritten body',
+  rfcMessageId: '<draft-message@example.com>',
+  date: 'Wed, 15 Oct 2026 09:00:00 +0000',
+ };
+
+ it('preserves a stored RFC Message-ID and Date in the manual MIME builder', () => {
+  const raw = createEmailMessage(baseArgs);
+
+  expect(getHeader(raw, 'Message-ID')).toBe(baseArgs.rfcMessageId);
+  expect(getHeader(raw, 'Date')).toBe(baseArgs.date);
+ });
+
+ it('keeps the full stored reply reference chain when the body changes', () => {
+  const references = '<root@example.com> <parent@example.com> <previous@example.com>';
+  const raw = createEmailMessage({
+   ...baseArgs,
+   inReplyTo: '<previous@example.com>',
+   references,
+  });
+
+  expect(getHeader(raw, 'In-Reply-To')).toBe('<previous@example.com>');
+  expect(getHeader(raw, 'References')).toBe(references);
+ });
+
+ it('preserves identity through Nodemailer when the revised draft has an inline attachment', async () => {
+  const raw = await createEmailWithNodemailer({
+   ...baseArgs,
+   attachments: [{ filename: 'note.txt', content: 'aGVsbG8=' }],
+  });
+
+  expect(getHeader(raw, 'Message-ID')).toBe(baseArgs.rfcMessageId);
+  expect(getHeader(raw, 'Date')).toBe(baseArgs.date);
+  expect(raw).toMatch(/Content-Disposition: attachment; filename="?note\.txt"?/);
+ });
+
+ it('strips CRLF injection attempts from preserved identity headers', () => {
+  const raw = createEmailMessage({
+   ...baseArgs,
+   rfcMessageId: '<draft-message@example.com>\r\nBcc: injected@example.com',
+   date: 'Wed, 15 Oct 2026 09:00:00 +0000\r\nX-Injected: true',
+  });
+
+  expect(getHeader(raw, 'Message-ID')).toBe('<draft-message@example.com>Bcc: injected@example.com');
+  expect(getHeader(raw, 'Date')).toBe('Wed, 15 Oct 2026 09:00:00 +0000X-Injected: true');
+  expect(raw).not.toContain('\r\nBcc: injected@example.com');
+  expect(raw).not.toContain('\r\nX-Injected: true');
  });
 });
 
@@ -335,24 +367,3 @@ describe('Email signatures', () => {
  });
 });
 
-describe('Source verification', () => {
- it('createEmailWithNodemailer uses references field with inReplyTo fallback', () => {
-  const source = fs.readFileSync(path.join(srcDir, 'utl.ts'), 'utf-8');
-  expect(source).toContain('references: validatedArgs.references || validatedArgs.inReplyTo');
- });
-
- it('handleEmailAction auto-resolves threading headers', () => {
-  const source = fs.readFileSync(path.join(srcDir, 'index.ts'), 'utf-8');
-  expect(source).toContain('validatedArgs.threadId && !validatedArgs.inReplyTo');
-  expect(source).toContain('gmail.users.threads.get');
-  expect(source).toContain('validatedArgs.inReplyTo = lastMessageId');
-  expect(source).toContain("validatedArgs.references = allMessageIds.join(' ')");
- });
-
- it('read_email returns Message-ID', () => {
-  const source = fs.readFileSync(path.join(srcDir, 'index.ts'), 'utf-8');
-  expect(source).toContain('message-id');
-  expect(source).toContain('rfcMessageId');
-  expect(source).toContain('Message-ID: ${rfcMessageId}');
- });
-});

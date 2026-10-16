@@ -41,6 +41,29 @@ export interface ResolvedBody {
 }
 
 /**
+ * The message fields accepted by either MIME builder.
+ *
+ * `rfcMessageId` is the RFC 5322 Message-ID header, not Gmail's opaque
+ * API message id. Updates pass it back unchanged when the live draft has one.
+ */
+export interface EmailMessageArgs {
+ to: string[];
+ subject: string;
+ body?: string;
+ htmlBody?: string;
+ mimeType?: string;
+ from?: string;
+ cc?: string[];
+ bcc?: string[];
+ threadId?: string;
+ inReplyTo?: string;
+ references?: string;
+ rfcMessageId?: string;
+ date?: string;
+ attachments?: AttachmentInput[];
+}
+
+/**
  * Normalise a text block so a copy that has been through MIME is still
  * recognisable: CRLF becomes LF and trailing whitespace comes off each line.
  * Line endings survive a Gmail round trip changed, so a byte comparison
@@ -134,7 +157,7 @@ function appendHtmlSignature(html: string, signature?: SignatureParts | null): s
  * A signature is appended to whichever parts the message carries.
  */
 export function resolveBodyParts(
- args: { body?: string; htmlBody?: string; mimeType?: string },
+ args: Pick<EmailMessageArgs, 'body' | 'htmlBody' | 'mimeType'>,
  signature?: SignatureParts | null,
 ): ResolvedBody {
  const rawText = args.body ?? '';
@@ -167,7 +190,7 @@ export function resolveBodyParts(
  return { mimeType: 'multipart/alternative', text, html };
 }
 
-export function createEmailMessage(validatedArgs: any, signature?: SignatureParts | null): string {
+export function createEmailMessage(validatedArgs: EmailMessageArgs, signature?: SignatureParts | null): string {
  const encodedSubject = encodeEmailHeader(sanitizeHeaderValue(validatedArgs.subject));
  // Resolve the body parts: Markdown-rendered HTML by default (see resolveBodyParts)
  const resolved = resolveBodyParts(validatedArgs, signature);
@@ -177,7 +200,7 @@ export function createEmailMessage(validatedArgs: any, signature?: SignaturePart
  const boundary = `----=_NextPart_${Math.random().toString(36).substring(2)}`;
 
  // Validate email addresses
- (validatedArgs.to as string[]).forEach(email => {
+ validatedArgs.to.forEach(email => {
   if (!validateEmail(email)) {
    throw new Error(`Recipient email address is invalid: ${email}`);
   }
@@ -185,9 +208,13 @@ export function createEmailMessage(validatedArgs: any, signature?: SignaturePart
 
  // Sanitize all user-supplied header values to prevent CRLF injection
  const from = sanitizeHeaderValue(validatedArgs.from || 'me');
- const to = (validatedArgs.to as string[]).map(sanitizeHeaderValue).join(', ');
- const cc = validatedArgs.cc ? (validatedArgs.cc as string[]).map(sanitizeHeaderValue).join(', ') : '';
- const bcc = validatedArgs.bcc ? (validatedArgs.bcc as string[]).map(sanitizeHeaderValue).join(', ') : '';
+ const to = validatedArgs.to.map(sanitizeHeaderValue).join(', ');
+ const cc = validatedArgs.cc ? validatedArgs.cc.map(sanitizeHeaderValue).join(', ') : '';
+ const bcc = validatedArgs.bcc ? validatedArgs.bcc.map(sanitizeHeaderValue).join(', ') : '';
+ const rfcMessageId = validatedArgs.rfcMessageId
+  ? sanitizeHeaderValue(validatedArgs.rfcMessageId)
+  : '';
+ const date = validatedArgs.date ? sanitizeHeaderValue(validatedArgs.date) : '';
  const inReplyTo = validatedArgs.inReplyTo ? sanitizeHeaderValue(validatedArgs.inReplyTo) : '';
  const references = validatedArgs.references
   ? sanitizeHeaderValue(validatedArgs.references)
@@ -200,6 +227,8 @@ export function createEmailMessage(validatedArgs: any, signature?: SignaturePart
   cc ? `Cc: ${cc}` : '',
   bcc ? `Bcc: ${bcc}` : '',
   `Subject: ${encodedSubject}`,
+  rfcMessageId ? `Message-ID: ${rfcMessageId}` : '',
+  date ? `Date: ${date}` : '',
   inReplyTo ? `In-Reply-To: ${inReplyTo}` : '',
   references ? `References: ${references}` : '',
   'MIME-Version: 1.0',
@@ -247,9 +276,61 @@ export function createEmailMessage(validatedArgs: any, signature?: SignaturePart
 }
 
 
-export async function createEmailWithNodemailer(validatedArgs: any, signature?: SignatureParts | null): Promise<string> {
+/**
+ * An attachment as a caller supplies it: a path on this machine, or the bytes
+ * inline. Remote callers have no path on this machine to name, so inline is
+ * the only form available to them.
+ */
+export type AttachmentInput = string | { filename: string; content: string; mimeType?: string };
+
+/** What nodemailer needs: a path to read, or a buffer to embed. */
+type NodemailerAttachment =
+ | { filename: string; path: string }
+ | { filename: string; content: Buffer; contentType: string };
+
+/**
+ * Turn caller-supplied attachments into nodemailer attachments.
+ *
+ * Base64 is validated rather than handed straight to Buffer.from, which
+ * silently discards anything it cannot decode: a mangled payload would
+ * otherwise become a truncated or empty file the recipient discovers, instead
+ * of an error the caller does.
+ */
+export function resolveAttachments(inputs: AttachmentInput[] = []): NodemailerAttachment[] {
+ return inputs.map((input, index) => {
+  if (typeof input === 'string') {
+   if (!fs.existsSync(input)) {
+    throw new Error(
+     `File does not exist: ${input}. A file path is only resolvable when this server runs on the same machine as the caller; ` +
+     `otherwise supply the bytes inline as {"filename": ..., "content": <base64>}.`,
+    );
+   }
+   return { filename: path.basename(input), path: input };
+  }
+
+  if (!input.filename) throw new Error(`Attachment ${index + 1} has no filename.`);
+  const label = `"${input.filename}"`;
+
+  const base64 = (input.content ?? '').replace(/\s+/g, '');
+  if (!base64) throw new Error(`Attachment ${label} has empty content.`);
+  if (base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64)) {
+   throw new Error(`Attachment ${label} has content that is not valid base64.`);
+  }
+
+  const content = Buffer.from(base64, 'base64');
+  if (content.length === 0) throw new Error(`Attachment ${label} decodes to zero bytes.`);
+
+  return {
+   filename: input.filename,
+   content,
+   contentType: input.mimeType || mimeLookup(input.filename) || 'application/octet-stream',
+  };
+ });
+}
+
+export async function createEmailWithNodemailer(validatedArgs: EmailMessageArgs, signature?: SignatureParts | null): Promise<string> {
  // Validate email addresses
- (validatedArgs.to as string[]).forEach(email => {
+ validatedArgs.to.forEach(email => {
   if (!validateEmail(email)) {
    throw new Error(`Recipient email address is invalid: ${email}`);
   }
@@ -262,26 +343,17 @@ export async function createEmailWithNodemailer(validatedArgs: any, signature?: 
   buffer: true
  });
 
- // Prepare attachments for nodemailer
- const attachments = [];
- for (const filePath of validatedArgs.attachments) {
-  if (!fs.existsSync(filePath)) {
-   throw new Error(`File does not exist: ${filePath}`);
-  }
-
-  const fileName = path.basename(filePath);
-
-  attachments.push({
-   filename: fileName,
-   path: filePath
-  });
- }
+ const attachments = resolveAttachments(validatedArgs.attachments);
 
  // Resolve the body parts: Markdown-rendered HTML by default (see resolveBodyParts).
  // nodemailer omits a part entirely when its field is undefined, which is how
  // text/plain-only and text/html-only stay single-part here.
  const resolved = resolveBodyParts(validatedArgs, signature);
 
+ const rfcMessageId = validatedArgs.rfcMessageId
+  ? sanitizeHeaderValue(validatedArgs.rfcMessageId)
+  : undefined;
+ const date = validatedArgs.date ? sanitizeHeaderValue(validatedArgs.date) : undefined;
  const mailOptions = {
   from: validatedArgs.from || 'me', // Gmail API uses default send-as if 'me', or specified alias
   to: validatedArgs.to.join(', '),
@@ -291,6 +363,8 @@ export async function createEmailWithNodemailer(validatedArgs: any, signature?: 
   text: resolved.text,
   html: resolved.html,
   attachments: attachments,
+  messageId: rfcMessageId,
+  date,
   inReplyTo: validatedArgs.inReplyTo,
   references: validatedArgs.references || validatedArgs.inReplyTo
  };
