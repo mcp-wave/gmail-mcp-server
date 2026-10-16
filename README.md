@@ -936,6 +936,8 @@ The token is `v1:<messageId>:<historyId>`. Both halves are compared because Gmai
 
 **3. Omitted fields are preserved, not blanked.** `to`, `subject`, `body`, `cc` and `bcc` are all optional now. Anything you leave out is carried over from the live draft, so changing the subject leaves a body you rewrote untouched. The response says what it did:
 
+When rebuilding a draft, the server also carries over its sender, Gmail thread ID, RFC `Message-ID`, `Date`, `In-Reply-To`, and complete `References` chain unless the edit explicitly supplies a new sender, thread, or reply target. The Gmail API `Message.id` used by the staleness token is separate from the RFC `Message-ID` header. Changing `inReplyTo` starts the reference chain at that new target rather than retaining an unrelated prior chain.
+
 ```
 Draft r-123... updated (ID unchanged). Changes: replaced subject; kept the draft's
 existing to, body, cc, bcc.

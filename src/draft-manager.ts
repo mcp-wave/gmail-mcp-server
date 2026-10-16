@@ -32,7 +32,7 @@
 
 import type { gmail_v1 } from 'googleapis';
 import { parseEmailAddresses } from './email-export.js';
-import type { AttachmentInput } from './utl.js';
+import type { AttachmentInput, EmailMessageArgs, EmailMimeType } from './utl.js';
 
 /** Thrown when an edit would overwrite content the caller has not seen. */
 export class StaleDraftError extends Error {
@@ -58,6 +58,12 @@ export interface DraftSnapshot {
  historyId: string;
  /** Opaque staleness token. Callers pass this back as `baseToken`. */
  token: string;
+ from: string;
+ threadId: string;
+ rfcMessageId: string;
+ date: string;
+ inReplyTo: string;
+ references: string;
  to: string[];
  cc: string[];
  bcc: string[];
@@ -110,12 +116,21 @@ export function headerToAddresses(header: string): string[] {
 export function buildDraftSnapshot(input: BuildSnapshotInput): DraftSnapshot {
  const { draft, headers, content, attachments } = input;
  const message = draft.message ?? {};
+ const payloadHeaders = message.payload?.headers ?? [];
+ const getPayloadHeader = (name: string): string =>
+  payloadHeaders.find(header => header.name?.toLowerCase() === name)?.value ?? '';
 
  return {
   draftId: draft.id ?? '',
   messageId: message.id ?? '',
   historyId: message.historyId ?? '',
   token: draftToken(message.id, message.historyId),
+  from: getPayloadHeader('from'),
+  threadId: message.threadId ?? '',
+  rfcMessageId: getPayloadHeader('message-id'),
+  date: getPayloadHeader('date'),
+  inReplyTo: getPayloadHeader('in-reply-to'),
+  references: getPayloadHeader('references'),
   to: headerToAddresses(headers.to),
   cc: headerToAddresses(headers.cc),
   bcc: headerToAddresses(headers.bcc),
@@ -133,20 +148,21 @@ export interface DraftEditArgs {
  subject?: string;
  body?: string;
  htmlBody?: string;
- mimeType?: string;
+ mimeType?: EmailMimeType;
  from?: string;
  threadId?: string;
  inReplyTo?: string;
+ /** Internal reply-chain override. The public update tool exposes inReplyTo only. */
+ references?: string;
  attachments?: AttachmentInput[];
  /** Token from a prior read of this draft. Required. */
  baseToken?: string;
- /** Acknowledge that the draft's existing attachments should be discarded. */
  dropAttachments?: boolean;
 }
 
 export interface MergedDraftEdit {
  /** Args for the message builders, with unsupplied fields filled from the live draft. */
- messageArgs: Record<string, unknown>;
+ messageArgs: EmailMessageArgs;
  /** Fields taken from the live draft because the caller did not supply them. */
  preserved: string[];
  /** Fields the caller supplied, overwriting whatever the draft held. */
@@ -199,11 +215,10 @@ export function mergeDraftEdit(current: DraftSnapshot, args: DraftEditArgs): Mer
   return supplied;
  };
 
- const messageArgs: Record<string, unknown> = {
+ const messageArgs: EmailMessageArgs = {
   to: take('to', args.to, current.to),
   subject: take('subject', args.subject, current.subject),
  };
-
  const cc = take('cc', args.cc, current.cc);
  if (cc.length > 0) messageArgs.cc = cc;
  const bcc = take('bcc', args.bcc, current.bcc);
@@ -222,12 +237,33 @@ export function mergeDraftEdit(current: DraftSnapshot, args: DraftEditArgs): Mer
  }
 
  if (args.mimeType !== undefined) messageArgs.mimeType = args.mimeType;
- if (args.from !== undefined) messageArgs.from = args.from;
- if (args.threadId !== undefined) messageArgs.threadId = args.threadId;
- if (args.inReplyTo !== undefined) messageArgs.inReplyTo = args.inReplyTo;
+
+ // These are omitted from the public edit schema but must survive a full MIME
+ // rebuild. An explicit sender or thread target still takes precedence.
+ messageArgs.from = take('from', args.from, current.from);
+ messageArgs.threadId = take('threadId', args.threadId, current.threadId);
+ messageArgs.rfcMessageId = current.rfcMessageId;
+ messageArgs.date = current.date;
+ preserved.push('rfcMessageId', 'date');
+
+ // A new reply target starts a new reference chain unless an internal caller
+ // deliberately provides one. Carry the complete existing chain when no new
+ // target was supplied, including when a caller repeats the current target.
+ const inReplyTo = take('inReplyTo', args.inReplyTo, current.inReplyTo);
+ messageArgs.inReplyTo = inReplyTo;
+ if (args.references !== undefined) {
+  messageArgs.references = args.references;
+  replaced.push('references');
+ } else if (args.inReplyTo !== undefined && args.inReplyTo !== current.inReplyTo) {
+  messageArgs.references = inReplyTo;
+  replaced.push('references');
+ } else {
+  messageArgs.references = current.references;
+  preserved.push('references');
+ }
  if (args.attachments !== undefined) messageArgs.attachments = args.attachments;
 
- if ((messageArgs.to as string[]).length === 0) {
+ if (messageArgs.to.length === 0) {
   throw new Error('The draft would be left with no recipients. Supply "to", or leave it out to keep the draft\'s existing recipients.');
  }
 

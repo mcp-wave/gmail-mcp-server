@@ -37,6 +37,12 @@ function snapshot(overrides: Partial<DraftSnapshot> = {}): DraftSnapshot {
         messageId: 'm-1',
         historyId: 'h-1',
         token: draftToken('m-1', 'h-1'),
+        from: 'author@example.com',
+        threadId: 't-1',
+        rfcMessageId: '<draft-message@example.com>',
+        date: 'Wed, 15 Oct 2026 10:00:00 -0600',
+        inReplyTo: '<parent@example.com>',
+        references: '<root@example.com> <parent@example.com>',
         to: ['recipient@example.com'],
         cc: [],
         bcc: [],
@@ -86,6 +92,38 @@ describe('buildDraftSnapshot', () => {
         expect(built.to).toEqual(['a@example.com']);
     });
 
+    it('extracts MIME identity and reply metadata from the full Gmail draft payload', () => {
+        const built = buildDraftSnapshot({
+            draft: {
+                id: 'r-9',
+                message: {
+                    id: 'gmail-message-9',
+                    historyId: 'h-9',
+                    threadId: 'gmail-thread-9',
+                    payload: {
+                        headers: [
+                            { name: 'From', value: 'Author <author@example.com>' },
+                            { name: 'Message-ID', value: '<rfc-message-9@example.com>' },
+                            { name: 'Date', value: 'Wed, 15 Oct 2026 10:00:00 -0600' },
+                            { name: 'In-Reply-To', value: '<parent@example.com>' },
+                            { name: 'References', value: '<root@example.com> <parent@example.com>' },
+                        ],
+                    },
+                },
+            },
+            headers: { subject: 'Hi', to: 'a@example.com', cc: '', bcc: '' },
+            content: { text: 'body', html: '<p>body</p>' },
+            attachments: [],
+        });
+
+        expect(built.from).toBe('Author <author@example.com>');
+        expect(built.threadId).toBe('gmail-thread-9');
+        expect(built.rfcMessageId).toBe('<rfc-message-9@example.com>');
+        expect(built.date).toBe('Wed, 15 Oct 2026 10:00:00 -0600');
+        expect(built.inReplyTo).toBe('<parent@example.com>');
+        expect(built.references).toBe('<root@example.com> <parent@example.com>');
+    });
+
     it('survives a draft with no message payload', () => {
         const built = buildDraftSnapshot({
             draft: { id: 'r-9' },
@@ -96,6 +134,12 @@ describe('buildDraftSnapshot', () => {
 
         expect(built.token).toBe('v1::');
         expect(built.to).toEqual([]);
+        expect(built.from).toBe('');
+        expect(built.threadId).toBe('');
+        expect(built.rfcMessageId).toBe('');
+        expect(built.date).toBe('');
+        expect(built.inReplyTo).toBe('');
+        expect(built.references).toBe('');
     });
 });
 
@@ -165,6 +209,35 @@ describe('mergeDraftEdit preserves what the caller did not touch', () => {
         expect(merged.replaced).toContain('body');
     });
 
+    it('preserves live MIME identity and thread metadata during a body-only edit', () => {
+        const current = snapshot({
+            from: 'Author <author@example.com>',
+            threadId: 'gmail-thread-9',
+            rfcMessageId: '<rfc-message-9@example.com>',
+            date: 'Wed, 15 Oct 2026 10:00:00 -0600',
+            inReplyTo: '<parent@example.com>',
+            references: '<root@example.com> <parent@example.com>',
+        });
+        const merged = mergeDraftEdit(current, { body: 'Rewritten by the agent' });
+
+        expect(merged.messageArgs).toMatchObject({
+            from: 'Author <author@example.com>',
+            threadId: 'gmail-thread-9',
+            rfcMessageId: '<rfc-message-9@example.com>',
+            date: 'Wed, 15 Oct 2026 10:00:00 -0600',
+            inReplyTo: '<parent@example.com>',
+            references: '<root@example.com> <parent@example.com>',
+        });
+        expect(merged.preserved).toEqual(expect.arrayContaining([
+            'from',
+            'threadId',
+            'rfcMessageId',
+            'date',
+            'inReplyTo',
+            'references',
+        ]));
+    });
+
     it('carries both body halves over together', () => {
         const merged = mergeDraftEdit(snapshot(), { subject: 'x' });
 
@@ -215,6 +288,16 @@ describe('mergeDraftEdit preserves what the caller did not touch', () => {
         expect(merged.messageArgs.threadId).toBe('t-1');
         expect(merged.messageArgs.inReplyTo).toBe('<msg@example.com>');
         expect(merged.messageArgs.mimeType).toBe('text/plain');
+    });
+
+    it('rebuilds references from an explicit reply target instead of keeping a stale chain', () => {
+        const merged = mergeDraftEdit(snapshot({
+            inReplyTo: '<old-parent@example.com>',
+            references: '<root@example.com> <old-parent@example.com>',
+        }), { inReplyTo: '<new-parent@example.com>' });
+
+        expect(merged.messageArgs.inReplyTo).toBe('<new-parent@example.com>');
+        expect(merged.messageArgs.references).toBe('<new-parent@example.com>');
     });
 });
 
