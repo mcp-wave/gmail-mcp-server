@@ -486,9 +486,9 @@ Basic Email (Markdown, sent as HTML plus plain text):
 
 **Email with Attachments:**
 
-Each attachment is either the bytes inline, or a path on the machine running
-the server. Inline is the only form available to a remote client, which has no
-path on the server to name:
+Each attachment is supplied inline as base64-encoded bytes. This is the required
+form for the hosted HTTP server, which never reads a filesystem path supplied by
+a remote caller:
 
 ```json
 {
@@ -503,7 +503,10 @@ path on the server to name:
 ```
 
 `content` is base64. `mimeType` is inferred from the filename when omitted.
-Invalid base64 is rejected rather than silently truncated.
+Invalid base64 is rejected rather than silently truncated. Hosted MCP requests
+are limited to 32 MiB of decoded JSON. Base64 and JSON envelope overhead mean
+the aggregate attachment bytes must stay below 24 MiB, and Gmail's own limits
+may reduce the usable total further.
 
 When the server runs locally alongside the caller (stdio), a path still works:
 
@@ -1299,7 +1302,8 @@ You can combine multiple operators: `from:john@example.com after:2024/01/01 has:
 
 The server provides comprehensive attachment functionality:
 
-- **Sending Attachments**: Supply each attachment inline as `{filename, content (base64), mimeType?}`, or as a path on the machine running the server. Remote clients have no server-side path, so inline is their only form.
+- **Sending Attachments**: Hosted clients supply every file inline as `{filename, content (base64), mimeType?}`. The hosted server never follows client-controlled filesystem paths. A local stdio session may use a path on its shared machine.
+- **Request Bound**: Hosted MCP JSON requests are limited to 32 MiB, so base64 overhead leaves less than 24 MiB of aggregate attachment bytes before Gmail's own limits.
 - **Attachment Detection**: Automatically detects MIME types and file sizes
 - **Download Capability**: Download any email attachment to your local filesystem
 - **Enhanced Display**: View detailed attachment information including filenames, types, sizes, and download IDs
@@ -1359,7 +1363,8 @@ The server includes efficient batch processing capabilities:
 - Never share or commit your credentials to version control
 - Regularly review and revoke unused access in your Google Account settings
 - Credentials are stored globally but are only accessible by the current user
-- **Attachment files are processed locally and never stored permanently by the server**
+- **Attachment bytes are processed transiently and never stored permanently by the server**
+- **Hosted attachment boundary**: The HTTP server accepts inline attachment bytes only. It rejects client-supplied filesystem paths before obtaining a Gmail client.
 
 ## Troubleshooting
 
@@ -1381,10 +1386,10 @@ The server includes efficient batch processing capabilities:
    - Consider reducing the batch size if you encounter rate limiting
 
 5. **Attachment Issues**
-   - **File Not Found**: A file path is resolved on the machine running the server. If you are talking to a remote server, no path of yours exists there: send the bytes inline as `{filename, content}` instead.
+   - **Hosted Attachments**: The HTTP server accepts only `{filename, content (base64), mimeType?}`. It never reads a path from a remote request.
+   - **File Not Found**: A local stdio path is resolved on the machine running the server. If it does not exist, send the bytes inline instead.
    - **Not Valid Base64**: Inline `content` must be base64. It is validated rather than silently truncated, so fix the encoding rather than retrying.
-   - **Permission Errors**: For the path form, check that the server has read access to the file
-   - **Size Limits**: Gmail has a 25MB attachment size limit per email
+   - **Size Limits**: Hosted MCP requests are capped at 32 MiB decoded JSON. Keep aggregate attachment bytes below 24 MiB after base64 overhead; Gmail can impose a smaller limit.
    - **Download Failures**: Verify you have write permissions to the download directory
 
 ## Contributing

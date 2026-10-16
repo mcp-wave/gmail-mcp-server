@@ -2,18 +2,23 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
 /**
- * An attachment is either a path on the machine running this server, or the
- * bytes themselves. The path form only works in a local stdio deployment where
- * the caller and the server share a filesystem; a remote client has no such
- * path to give, so it must send content inline.
+ * A base64-encoded attachment supplied by the MCP client. This form is safe for
+ * remote sessions because it never asks the server to read a client-controlled
+ * filesystem path.
  */
-export const AttachmentSchema = z.union([
- z.string().describe("Absolute path to a file on the machine running this server. Only usable when the server runs locally alongside the caller; remote clients must use the inline {filename, content} form."),
- z.object({
+export const InlineAttachmentSchema = z.object({
   filename: z.string().describe("Filename the recipient sees"),
   content: z.string().describe("The file's bytes, base64-encoded"),
   mimeType: z.string().optional().describe("Content type, e.g. 'application/pdf'. Inferred from the filename when omitted."),
- }),
+});
+
+/**
+ * Stdio sessions can also refer to a path on the shared local filesystem.
+ * Hosted tool advertisements use InlineAttachmentSchema exclusively.
+ */
+export const AttachmentSchema = z.union([
+ z.string().describe("Absolute path to a file on the machine running this server. Only usable when the server runs locally alongside the caller; remote clients must use the inline {filename, content} form."),
+ InlineAttachmentSchema,
 ]);
 
 // Schema definitions
@@ -593,12 +598,38 @@ export const toolDefinitions: ToolDefinition[] = [
   },
 ];
 
-// Convert tool definitions to MCP tool format
-export function toMcpTools(tools: ToolDefinition[]) {
+export interface McpToolOptions {
+ localFileAccess?: boolean;
+}
+
+const InlineAttachmentListSchema = z.array(InlineAttachmentSchema)
+ .optional()
+ .describe("Files to attach. Provide each file inline as { filename, content (base64), mimeType? }. Remote sessions cannot read filesystem paths.");
+
+function schemaForMcp(tool: ToolDefinition, localFileAccess: boolean): z.ZodTypeAny {
+ if (localFileAccess) return tool.schema;
+
+ switch (tool.name) {
+  case 'send_email':
+  case 'draft_email':
+   return SendEmailSchema.extend({ attachments: InlineAttachmentListSchema });
+  case 'update_draft':
+   return UpdateDraftSchema.extend({ attachments: InlineAttachmentListSchema });
+  case 'reply_all':
+   return ReplyAllSchema.extend({ attachments: InlineAttachmentListSchema });
+  default:
+   return tool.schema;
+ }
+}
+
+// Convert tool definitions to MCP tool format. Local filesystem paths are
+// advertised only for an explicitly capable stdio session.
+export function toMcpTools(tools: ToolDefinition[], options: McpToolOptions = {}) {
+ const localFileAccess = options.localFileAccess === true;
  return tools.map(tool => ({
   name: tool.name,
   description: tool.description,
-  inputSchema: zodToJsonSchema(tool.schema),
+  inputSchema: zodToJsonSchema(schemaForMcp(tool, localFileAccess)),
   annotations: tool.annotations,
  }));
 }

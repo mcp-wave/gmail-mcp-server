@@ -33,6 +33,9 @@ export type PrincipalSession = {
     principalId: string;
     accounts: Account[];
     getClient: (sub: string) => { gmail: GmailClient; authorizedScopes: string[] };
+    // Only the local stdio entrypoint grants access to paths on the server's
+    // filesystem. Omission deliberately denies access for hosted sessions.
+    readonly localFileAccess?: boolean;
     // Account-management ops, present only on the hosted (multi-account) server.
     linkAccount?: () => Promise<string>; // returns a sign-in URL for the user
     unlinkAccount?: (sub: string) => Promise<void>;

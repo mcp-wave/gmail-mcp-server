@@ -14,7 +14,7 @@ import type { Request, Response } from 'express';
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { createStatelessMcpEndpoint, type McpServerFactory } from './mcp-endpoint.js';
-import { createRelay } from './relay.js';
+import { createRelay, type ClientRequestRelay } from './relay.js';
 import { loadHttpConfig, type HttpConfig } from './config.js';
 import { createStore } from './store.js';
 import { GmailOAuthProvider } from './provider.js';
@@ -58,13 +58,32 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
     }, 5 * 60 * 1000);
     sweep.unref?.();
 
+    const app = createHttpApp(config, store, relay, provider, cache, createMcpServer);
+    app.listen(config.port, () => {
+        console.error(`Gmail MCP server (http) listening on port ${config.port}`);
+        console.error(`Public base URL: ${config.baseUrl}`);
+        console.error(`MCP endpoint:    ${config.resourceUrl}`);
+        console.error(`Google callback: ${config.googleCallbackUrl}`);
+        console.error(`Google scopes:   ${config.googleScopeNames.join(', ')}`);
+    });
+}
+
+export function createHttpApp(
+    config: HttpConfig,
+    store: OAuthStore,
+    relay: ClientRequestRelay,
+    provider: GmailOAuthProvider,
+    cache: GmailClientCache,
+    createMcpServer: McpServerFactory,
+    resolveSessionOverride?: ResolveSession,
+): express.Express {
     // Resolve the caller's principal (and all its linked Gmail accounts) from the
     // bearer token. Clients are pre-resolved so getClient() can be synchronous.
-    const resolveSession: ResolveSession = async (extra) => {
+    const resolveSession = resolveSessionOverride ?? (async (extra) => {
         const principalId = extra?.authInfo?.extra?.principalId as string | undefined;
         if (!principalId) throw new ReauthRequiredError('Missing authentication context.');
         return buildPrincipalSession(config, store, cache, provider, principalId);
-    };
+    });
 
     const app = express();
     app.disable('x-powered-by');
@@ -264,20 +283,14 @@ export async function startHttpServer(createMcpServer: McpServerFactory): Promis
     // Stateless Streamable HTTP: no session id, a fresh transport and MCP Server
     // per request, nothing held between requests.
     const mcp = createStatelessMcpEndpoint(createMcpServer, resolveSession, relay);
-    app.post('/mcp', origin, bearer, express.json(), mcp.post);
+    app.post('/mcp', origin, bearer, express.json({ limit: 32 * 1024 * 1024 }), mcp.post);
     // No standalone notification stream and no session to delete.
     app.get('/mcp', origin, bearer, mcp.methodNotAllowed);
     app.delete('/mcp', origin, bearer, mcp.methodNotAllowed);
 
     app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));
 
-    app.listen(config.port, () => {
-        console.error(`Gmail MCP server (http) listening on port ${config.port}`);
-        console.error(`Public base URL: ${config.baseUrl}`);
-        console.error(`MCP endpoint:    ${config.resourceUrl}`);
-        console.error(`Google callback: ${config.googleCallbackUrl}`);
-        console.error(`Google scopes:   ${config.googleScopeNames.join(', ')}`);
-    });
+    return app;
 }
 
 function sanitize(s: string): string {
@@ -410,6 +423,7 @@ async function buildPrincipalSession(
     return {
         principalId,
         accounts,
+        localFileAccess: false,
         getClient: (sub: string) => {
             const c = clients.get(sub);
             if (!c) throw new ReauthRequiredError('Mailbox unavailable. Please reconnect that account.');

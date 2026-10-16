@@ -83,6 +83,31 @@ const WRITE_TOOLS = new Set([
  'repair_drafts',
 ]);
 
+// The dispatcher, rather than a tool schema, enforces this boundary because
+// callers can invoke tools with arguments that were never advertised to them.
+const ATTACHMENT_INPUT_TOOLS: Record<string, true> = {
+ send_email: true,
+ draft_email: true,
+ update_draft: true,
+ reply_all: true,
+};
+
+function includesLocalAttachment(args: unknown): boolean {
+ if (!args || typeof args !== 'object' || !('attachments' in args)) return false;
+ const { attachments } = args;
+ return Array.isArray(attachments) && attachments.some(attachment => typeof attachment === 'string');
+}
+
+function localAttachmentDenied() {
+ return {
+  isError: true,
+  content: [{
+   type: 'text',
+   text: 'Error: This session cannot read server filesystem paths for attachments. Send each file inline as { filename, content (base64), mimeType? } instead.',
+  }],
+ };
+}
+
 const errText = (text: string) => ({ content: [{ type: 'text', text }] });
 
 function unionScopes(accounts: Account[]): string[] {
@@ -657,6 +682,7 @@ async function main() {
   principalId: 'local',
   accounts: [{ sub: 'local', email: 'me', primary: true, scopeNames: authorizedScopes }],
   getClient: () => ({ gmail, authorizedScopes }),
+  localFileAccess: true,
  };
  const server = createMcpServer(() => stdioSession);
  const transport = new StdioServerTransport();
@@ -669,7 +695,7 @@ async function main() {
  * local account; for http (multi-tenant) it is the caller's own Gmail client,
  * derived from the validated bearer token.
  */
-function createMcpServer(resolveSession: ResolveSession): Server {
+export function createMcpServer(resolveSession: ResolveSession): Server {
  // Server implementation
  const server = new Server(
   {
@@ -693,7 +719,9 @@ function createMcpServer(resolveSession: ResolveSession): Server {
   );
   // Advertise the `account` selector on every Gmail tool, then append the
   // account-management meta tools.
-  const gmailTools = toMcpTools(availableTools).map((t: any) => ({
+  const gmailTools = toMcpTools(availableTools, {
+   localFileAccess: session.localFileAccess === true,
+  }).map((t: any) => ({
    ...t,
    inputSchema: {
     ...t.inputSchema,
@@ -2551,6 +2579,12 @@ function createMcpServer(resolveSession: ResolveSession): Server {
    return errText(`Error: Tool "${name}" is not available. You may need to re-authenticate with additional scopes.`);
   }
 
+  // This must remain before account selection and getClient(): argument schemas
+  // only describe clients that listed tools, while callers can invoke any name.
+  if (ATTACHMENT_INPUT_TOOLS[name] && session.localFileAccess !== true && includesLocalAttachment(args)) {
+   return localAttachmentDenied();
+  }
+
   const sendCtx = (a: Account): SendContext => ({
    ownEmail: a.email,
    policy: a.sendPolicy,
@@ -2622,7 +2656,18 @@ function createMcpServer(resolveSession: ResolveSession): Server {
  return server;
 }
 
-main().catch((error) => {
- console.error('Server error:', error);
- process.exit(1);
-});
+function isEntrypoint(): boolean {
+ if (!process.argv[1]) return false;
+ try {
+  return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+ } catch {
+  return false;
+ }
+}
+
+if (isEntrypoint()) {
+ main().catch((error) => {
+  console.error('Server error:', error);
+  process.exit(1);
+ });
+}
