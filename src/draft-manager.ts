@@ -206,7 +206,7 @@ export function mergeDraftEdit(current: DraftSnapshot, args: DraftEditArgs): Mer
  const threadChanged =
   args.threadId !== undefined &&
   args.threadId !== current.threadId;
- if (threadChanged && !args.threadId.trim()) {
+ if (threadChanged && !args.threadId?.trim()) {
   throw new Error('Changing a draft thread requires a nonblank "threadId".');
  }
  if (threadChanged && !args.inReplyTo?.trim()) {
