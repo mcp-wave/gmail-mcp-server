@@ -475,11 +475,17 @@ function formatDraftSnapshot(snapshot: DraftSnapshot): string {
  const lines = [
   `Draft ${snapshot.draftId}`,
   `baseToken: ${snapshot.token}`,
+  `From: ${snapshot.from || '(default send-as)'}`,
   `To: ${snapshot.to.join(', ') || '(none)'}`,
  ];
  if (snapshot.cc.length > 0) lines.push(`Cc: ${snapshot.cc.join(', ')}`);
  if (snapshot.bcc.length > 0) lines.push(`Bcc: ${snapshot.bcc.join(', ')}`);
  lines.push(`Subject: ${snapshot.subject || '(none)'}`);
+ if (snapshot.threadId) lines.push(`Thread ID: ${snapshot.threadId}`);
+ if (snapshot.rfcMessageId) lines.push(`Message-ID: ${snapshot.rfcMessageId}`);
+ if (snapshot.date) lines.push(`Date: ${snapshot.date}`);
+ if (snapshot.inReplyTo) lines.push(`In-Reply-To: ${snapshot.inReplyTo}`);
+ if (snapshot.references) lines.push(`References: ${snapshot.references}`);
  if (snapshot.attachments.length > 0) {
   lines.push(`Attachments: ${snapshot.attachments.map(a => `${a.filename} (${a.mimeType}, ${Math.round(a.size / 1024)} KB)`).join(', ')}`);
  }
