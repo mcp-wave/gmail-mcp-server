@@ -125,7 +125,7 @@ describe('hosted attachment boundary', () => {
         for (const [tool, baseArgs] of tools) {
             for (const attachment of [...paths, [canaryPath, { filename: 'safe.txt', content: Buffer.from(CANARY).toString('base64') }]]) {
                 const state = fakeGmail();
-                const result = await callTool(makeSession(state, false), tool, { ...baseArgs, attachments: attachment });
+                const result = await callTool(makeSession(state, false), tool, { ...baseArgs, attachments: Array.isArray(attachment) ? attachment : [attachment] });
                 expect(result.isError).toBe(true);
                 expect(JSON.stringify(result.content)).toMatch(/inline/i);
                 expect(state.rawMessages).toEqual([]);
@@ -163,7 +163,7 @@ describe('hosted attachment boundary', () => {
 
         expect(result.isError).not.toBe(true);
         expect(state.rawMessages).toHaveLength(1);
-        expect(rawMessage(state.rawMessages[0])).toContain(CANARY);
+        expect(rawMessage(state.rawMessages[0])).toContain(Buffer.from(CANARY).toString('base64'));
     });
 
     it('allows inline bytes with a path-shaped filename without reading a path', async () => {
@@ -178,7 +178,7 @@ describe('hosted attachment boundary', () => {
 
         expect(result.isError).not.toBe(true);
         expect(state.rawMessages).toHaveLength(1);
-        expect(rawMessage(state.rawMessages[0])).toContain(CANARY);
+        expect(rawMessage(state.rawMessages[0])).toContain(Buffer.from(CANARY).toString('base64'));
     });
 
     it('keeps interleaved hosted and stdio listings isolated', async () => {

@@ -153,7 +153,7 @@ describe('hosted MCP attachment boundary over HTTP', () => {
             headers: {
                 authorization: `Bearer ${BEARER}`,
                 'content-type': 'application/json',
-                accept: 'application/json',
+                accept: 'application/json, text/event-stream',
             },
             body: JSON.stringify({
                 jsonrpc: '2.0',
@@ -183,7 +183,7 @@ describe('hosted MCP attachment boundary over HTTP', () => {
             headers: {
                 authorization: `Bearer ${BEARER}`,
                 'content-type': 'application/json',
-                accept: 'application/json',
+                accept: 'application/json, text/event-stream',
             },
             body: JSON.stringify({
                 jsonrpc: '2.0',
@@ -208,21 +208,21 @@ describe('hosted MCP attachment boundary over HTTP', () => {
 
     it('accepts a request below the MCP JSON limit and rejects one byte above it before execution', async () => {
         const template = jsonRpcBody('');
-        const withinContent = 'A'.repeat(MAX_MCP_JSON_BYTES - Buffer.byteLength(template) - 4);
+        const withinContent = 'A'.repeat(MAX_MCP_JSON_BYTES - Buffer.byteLength(template));
         const within = jsonRpcBody(withinContent);
-        expect(Buffer.byteLength(within)).toBeLessThan(MAX_MCP_JSON_BYTES);
+        expect(Buffer.byteLength(within)).toBe(MAX_MCP_JSON_BYTES);
         const withinResponse = await fetch(`${baseUrl}/mcp`, {
             method: 'POST',
-            headers: { authorization: `Bearer ${BEARER}`, 'content-type': 'application/json' },
+            headers: { authorization: `Bearer ${BEARER}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
             body: within,
         });
-        expect(withinResponse.status).not.toBe(413);
+        expect(withinResponse.status).toBe(200);
 
-        const tooLarge = jsonRpcBody(`${withinContent}AAAAA`);
-        expect(Buffer.byteLength(tooLarge)).toBeGreaterThan(MAX_MCP_JSON_BYTES);
+        const tooLarge = jsonRpcBody(`${withinContent}A`);
+        expect(Buffer.byteLength(tooLarge)).toBe(MAX_MCP_JSON_BYTES + 1);
         const oversizedResponse = await fetch(`${baseUrl}/mcp`, {
             method: 'POST',
-            headers: { authorization: `Bearer ${BEARER}`, 'content-type': 'application/json' },
+            headers: { authorization: `Bearer ${BEARER}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
             body: tooLarge,
         });
         expect(oversizedResponse.status).toBe(413);
