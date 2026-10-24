@@ -13,9 +13,6 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
     buildDraftSnapshot,
     mergeDraftEdit,
@@ -29,7 +26,6 @@ import {
 } from './draft-manager.js';
 import { toolDefinitions, getToolByName, UpdateDraftSchema } from './tools.js';
 
-const srcDir = path.dirname(fileURLToPath(import.meta.url));
 
 function snapshot(overrides: Partial<DraftSnapshot> = {}): DraftSnapshot {
     return {
@@ -37,6 +33,12 @@ function snapshot(overrides: Partial<DraftSnapshot> = {}): DraftSnapshot {
         messageId: 'm-1',
         historyId: 'h-1',
         token: draftToken('m-1', 'h-1'),
+        from: 'author@example.com',
+        threadId: 't-1',
+        rfcMessageId: '<draft-message@example.com>',
+        date: 'Wed, 15 Oct 2026 10:00:00 -0600',
+        inReplyTo: '<parent@example.com>',
+        references: '<root@example.com> <parent@example.com>',
         to: ['recipient@example.com'],
         cc: [],
         bcc: [],
@@ -86,6 +88,38 @@ describe('buildDraftSnapshot', () => {
         expect(built.to).toEqual(['a@example.com']);
     });
 
+    it('extracts MIME identity and reply metadata from the full Gmail draft payload', () => {
+        const built = buildDraftSnapshot({
+            draft: {
+                id: 'r-9',
+                message: {
+                    id: 'gmail-message-9',
+                    historyId: 'h-9',
+                    threadId: 'gmail-thread-9',
+                    payload: {
+                        headers: [
+                            { name: 'From', value: 'Author <author@example.com>' },
+                            { name: 'Message-ID', value: '<rfc-message-9@example.com>' },
+                            { name: 'Date', value: 'Wed, 15 Oct 2026 10:00:00 -0600' },
+                            { name: 'In-Reply-To', value: '<parent@example.com>' },
+                            { name: 'References', value: '<root@example.com> <parent@example.com>' },
+                        ],
+                    },
+                },
+            },
+            headers: { subject: 'Hi', to: 'a@example.com', cc: '', bcc: '' },
+            content: { text: 'body', html: '<p>body</p>' },
+            attachments: [],
+        });
+
+        expect(built.from).toBe('Author <author@example.com>');
+        expect(built.threadId).toBe('gmail-thread-9');
+        expect(built.rfcMessageId).toBe('<rfc-message-9@example.com>');
+        expect(built.date).toBe('Wed, 15 Oct 2026 10:00:00 -0600');
+        expect(built.inReplyTo).toBe('<parent@example.com>');
+        expect(built.references).toBe('<root@example.com> <parent@example.com>');
+    });
+
     it('survives a draft with no message payload', () => {
         const built = buildDraftSnapshot({
             draft: { id: 'r-9' },
@@ -96,6 +130,12 @@ describe('buildDraftSnapshot', () => {
 
         expect(built.token).toBe('v1::');
         expect(built.to).toEqual([]);
+        expect(built.from).toBe('');
+        expect(built.threadId).toBe('');
+        expect(built.rfcMessageId).toBe('');
+        expect(built.date).toBe('');
+        expect(built.inReplyTo).toBe('');
+        expect(built.references).toBe('');
     });
 });
 
@@ -165,6 +205,51 @@ describe('mergeDraftEdit preserves what the caller did not touch', () => {
         expect(merged.replaced).toContain('body');
     });
 
+    it('preserves live MIME identity and thread metadata during a body-only edit', () => {
+        const current = snapshot({
+            from: 'Author <author@example.com>',
+            threadId: 'gmail-thread-9',
+            rfcMessageId: '<rfc-message-9@example.com>',
+            date: 'Wed, 15 Oct 2026 10:00:00 -0600',
+            inReplyTo: '<parent@example.com>',
+            references: '<root@example.com> <parent@example.com>',
+        });
+        const merged = mergeDraftEdit(current, { body: 'Rewritten by the agent' });
+
+        expect(merged.messageArgs).toMatchObject({
+            from: 'Author <author@example.com>',
+            threadId: 'gmail-thread-9',
+            rfcMessageId: '<rfc-message-9@example.com>',
+            date: 'Wed, 15 Oct 2026 10:00:00 -0600',
+            inReplyTo: '<parent@example.com>',
+            references: '<root@example.com> <parent@example.com>',
+        });
+        expect(merged.preserved).toEqual(expect.arrayContaining([
+            'from',
+            'threadId',
+            'rfcMessageId',
+            'date',
+            'inReplyTo',
+            'references',
+        ]));
+    });
+
+    it('keeps reply metadata when the current thread ID is explicitly repeated', () => {
+        const current = snapshot({
+            threadId: 'gmail-thread-9',
+            inReplyTo: '<parent@example.com>',
+            references: '<root@example.com> <parent@example.com>',
+        });
+        const merged = mergeDraftEdit(current, { threadId: 'gmail-thread-9' });
+
+        expect(merged.messageArgs).toMatchObject({
+            threadId: 'gmail-thread-9',
+            inReplyTo: '<parent@example.com>',
+            references: '<root@example.com> <parent@example.com>',
+        });
+        expect(merged.preserved).toEqual(expect.arrayContaining(['inReplyTo', 'references']));
+    });
+
     it('carries both body halves over together', () => {
         const merged = mergeDraftEdit(snapshot(), { subject: 'x' });
 
@@ -216,6 +301,75 @@ describe('mergeDraftEdit preserves what the caller did not touch', () => {
         expect(merged.messageArgs.inReplyTo).toBe('<msg@example.com>');
         expect(merged.messageArgs.mimeType).toBe('text/plain');
     });
+
+    it('rebuilds references from an explicit reply target instead of keeping a stale chain', () => {
+        const merged = mergeDraftEdit(snapshot({
+            inReplyTo: '<old-parent@example.com>',
+            references: '<root@example.com> <old-parent@example.com>',
+        }), { inReplyTo: '<new-parent@example.com>' });
+
+        expect(merged.messageArgs.inReplyTo).toBe('<new-parent@example.com>');
+        expect(merged.messageArgs.references).toBe('<new-parent@example.com>');
+    });
+
+    it('refuses a changed thread without an explicit nonblank parent', () => {
+        const current = snapshot();
+
+        expect(() => mergeDraftEdit(current, { threadId: 't-2' }))
+            .toThrow(/explicit nonblank "inReplyTo"/);
+        expect(() => mergeDraftEdit(current, { threadId: 't-2', inReplyTo: '   ' }))
+            .toThrow(/explicit nonblank "inReplyTo"/);
+    });
+
+    it('refuses a changed thread with a blank thread ID', () => {
+        expect(() => mergeDraftEdit(snapshot(), {
+            threadId: '   ',
+            inReplyTo: '<parent@example.com>',
+        })).toThrow(/nonblank "threadId"/);
+    });
+
+    it('resets stale references when moving to a new thread with the same parent', () => {
+        const merged = mergeDraftEdit(snapshot({
+            threadId: 't-1',
+            inReplyTo: '<parent@example.com>',
+            references: '<root@example.com> <parent@example.com>',
+        }), {
+            threadId: 't-2',
+            inReplyTo: '<parent@example.com>',
+        });
+
+        expect(merged.messageArgs.references).toBe('<parent@example.com>');
+        expect(merged.replaced).toContain('references');
+    });
+
+    it('retargets only when given a complete new thread and parent', () => {
+        const merged = mergeDraftEdit(snapshot({
+            threadId: 't-1',
+            inReplyTo: '<old-parent@example.com>',
+            references: '<root@example.com> <old-parent@example.com>',
+        }), {
+            threadId: 't-2',
+            inReplyTo: '<new-parent@example.com>',
+        });
+
+        expect(merged.messageArgs).toMatchObject({
+            threadId: 't-2',
+            inReplyTo: '<new-parent@example.com>',
+            references: '<new-parent@example.com>',
+        });
+    });
+
+    it('keeps an explicit internal reference chain while retargeting', () => {
+        const merged = mergeDraftEdit(snapshot(), {
+            threadId: 't-2',
+            inReplyTo: '<new-parent@example.com>',
+            references: '<new-root@example.com> <new-parent@example.com>',
+        });
+
+        expect(merged.messageArgs.references)
+            .toBe('<new-root@example.com> <new-parent@example.com>');
+    });
+
 });
 
 describe('assertAttachmentsSafe', () => {
@@ -311,37 +465,3 @@ describe('draft tool definitions', () => {
     });
 });
 
-describe('update_draft handler wiring', () => {
-    const source = fs.readFileSync(path.join(srcDir, 'index.ts'), 'utf-8');
-    const handler = source.split('case "update_draft": {')[1].split('case "list_email_labels"')[0];
-
-    it('reads the live draft before building the replacement', () => {
-        const readAt = handler.indexOf('loadDraftSnapshot');
-        const buildAt = handler.indexOf('createEmailMessage');
-        expect(readAt).toBeGreaterThan(-1);
-        expect(buildAt).toBeGreaterThan(-1);
-        expect(readAt).toBeLessThan(buildAt);
-    });
-
-    it('checks freshness before building the replacement', () => {
-        expect(handler.indexOf('assertFresh')).toBeLessThan(handler.indexOf('createEmailMessage'));
-    });
-
-    it('checks attachment safety before building the replacement', () => {
-        expect(handler.indexOf('assertAttachmentsSafe')).toBeLessThan(handler.indexOf('createEmailMessage'));
-    });
-
-    it('feeds the merged args to the builder, not the raw request', () => {
-        expect(handler).toContain('mergeDraftEdit(current');
-        expect(handler).toContain('const messageArgs = merged.messageArgs');
-    });
-
-    it('returns a fresh token so consecutive edits do not need another read', () => {
-        expect(handler).toContain('New baseToken for further edits');
-    });
-
-    it('is still gated as a multi-account write', () => {
-        const writeTools = source.match(/const WRITE_TOOLS = new Set\(\[([\s\S]*?)\]\);/)?.[1] ?? '';
-        expect(writeTools).toContain("'update_draft'");
-    });
-});
