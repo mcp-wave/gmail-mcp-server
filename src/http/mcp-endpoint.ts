@@ -26,6 +26,7 @@ import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { ClientRequestBridge } from './client-requests.js';
 import type { ClientRequestRelay } from './relay.js';
 import type { ResolveSession } from '../session.js';
+import { withRequestLifetime } from '../download-content.js';
 
 /** Builds the MCP Server with all tool handlers (implemented in index.ts). */
 export type McpServerFactory = (resolve: ResolveSession) => Server;
@@ -74,14 +75,23 @@ export function createStatelessMcpEndpoint(
 
         // The response closing is the end of this request's world: drop anything
         // it was waiting on and abort its in-flight handlers.
+        const endOfRequest: Array<() => void> = [];
         res.on('close', () => {
             untrack();
-            void server.close().catch(() => {});
+            void server.close().catch(() => { });
+            for (const release of endOfRequest.splice(0)) release();
         });
 
         try {
-            await server.connect(transport);
-            await transport.handleRequest(req, res, req.body);
+            // Inline downloads hold their memory budget until the response has
+            // been flushed, not merely until the tool handler returned.
+            await withRequestLifetime(release => {
+                if (res.writableFinished || res.destroyed) release();
+                else endOfRequest.push(release);
+            }, async () => {
+                await server.connect(transport);
+                await transport.handleRequest(req, res, req.body);
+            });
         } catch (err: any) {
             console.error('MCP request error:', err?.message || err);
             if (!res.headersSent) {
