@@ -102,5 +102,5 @@ After every push (to any branch), check CI status: `gh run list --branch {branch
 
 ## Session Hygiene
 
-- **Always end on `experimental` branch.** Before finishing a session, verify: `git branch --show-current` = `experimental`. If not, `git checkout experimental`.
-- Local working copy should always track `experimental` since that's the active development branch.
+- In OMP, leave the assigned workspace and branch under harness control. Do not switch a shared or managed checkout to `experimental`.
+- Outside OMP, end on `experimental`: verify `git branch --show-current` and, if needed, `git checkout experimental`. The local working copy tracks `experimental`, the active development branch.
