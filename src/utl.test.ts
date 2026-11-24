@@ -216,7 +216,7 @@ describe('Email signatures', () => {
   expect(raw).toContain('Content-Type: text/plain; charset=UTF-8');
   expect(raw).toContain('Content-Type: text/html; charset=UTF-8');
   expect(raw).toContain('Hello world\n\n-- \nJane Doe\nAcme Corp');
-  expect(raw).toContain(`<div class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}"><p>-- <br><b>Jane Doe</b><br>Acme Corp</p></div>`);
+  expect(raw).toContain(wrapSignatureHtml(signature.html));
   expect(raw).toContain('<div><br></div>');
  });
 
@@ -309,6 +309,43 @@ describe('Email signatures', () => {
   expect(resolved.html).toBe(`<p>Hello</p>\n<div><br></div>\n${wrapSignatureHtml(signature.html)}`);
  });
 
+ it('still signs a reply whose quoted earlier message carries its own signature block', () => {
+  const quoted =
+   `<div class="gmail_quote"><blockquote class="gmail_quote"><p>Earlier</p>` +
+   `<div dir="ltr" class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}">Their Signature</div></blockquote></div>`;
+  const resolved = resolveBodyParts({ htmlBody: `<p>Reply</p>${quoted}`, mimeType: 'text/html' }, signature);
+
+  expect(resolved.html).toContain(quoted);
+  expect(resolved.html?.endsWith(wrapSignatureHtml(signature.html))).toBe(true);
+  expect(occurrences(resolved.html ?? '', 'Their Signature')).toBe(1);
+ });
+
+ it('does not strip a copy of the signature that sits inside a quoted message', () => {
+  const quoted = `<blockquote>${wrapSignatureHtml(signature.html)}</blockquote>`;
+  const resolved = resolveBodyParts({ htmlBody: `<p>Reply</p>${quoted}`, mimeType: 'text/html' }, signature);
+
+  expect(occurrences(resolved.html ?? '', 'Jane Doe')).toBe(2);
+  expect(resolved.html?.endsWith(wrapSignatureHtml(signature.html))).toBe(true);
+ });
+
+ it('writes the "-- " separator for a signature that does not carry its own', () => {
+  const plain: SignatureParts = { text: 'Jane Doe', html: '<div>Jane Doe</div>' };
+  const resolved = resolveBodyParts({ body: 'Hello', mimeType: 'text/html' }, plain);
+
+  expect(resolved.html).toBe(
+   `<p>Hello</p>\n<div><br></div>\n<span class="gmail_signature_prefix">-- </span><br>` +
+   `<div dir="ltr" class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}"><div>Jane Doe</div></div>`,
+  );
+ });
+
+ it('is idempotent: re-resolving a signed HTML body adds nothing', () => {
+  const plain: SignatureParts = { text: 'Jane Doe', html: '<div>Jane Doe</div>' };
+  const once = resolveBodyParts({ body: 'Hello', mimeType: 'text/html' }, plain).html ?? '';
+  const twice = resolveBodyParts({ htmlBody: once, mimeType: 'text/html' }, plain).html;
+
+  expect(twice).toBe(once);
+ });
+
  it('appends text signature and emits no HTML part when mimeType is text/plain', () => {
   const resolved = resolveBodyParts({ body: 'Hello', mimeType: 'text/plain' }, signature);
 
@@ -333,7 +370,7 @@ describe('Email signatures', () => {
   expect(resolved.mimeType).toBe('text/html');
   expect(resolved.text).toBeUndefined();
   expect(resolved.html).toBe(
-   `${handAuthoredHtml}\n<div><br></div>\n<div class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}">${signature.html}</div>`,
+   `${handAuthoredHtml}\n<div><br></div>\n${wrapSignatureHtml(signature.html)}`,
   );
  });
 
@@ -342,9 +379,7 @@ describe('Email signatures', () => {
 
   expect(resolved.mimeType).toBe('multipart/alternative');
   expect(resolved.text).toBe(signature.text);
-  expect(resolved.html).toBe(
-   `<div class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}">${signature.html}</div>`,
-  );
+  expect(resolved.html).toBe(wrapSignatureHtml(signature.html));
 
   const raw = createEmailMessage({ to: ['a@example.com'], subject: 'S', body: '' }, signature);
   expect(getHeader(raw, 'Content-Type')).toMatch(/^multipart\/alternative; boundary=/);

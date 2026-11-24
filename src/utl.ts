@@ -114,12 +114,57 @@ function appendTextSignature(body: string, signature?: SignatureParts | null): s
 }
 
 /**
- * Append the signature to an HTML body, exactly once.
+ * Split HTML into runs inside and outside `<blockquote>` elements.
  *
- * A body already carrying exactly one signature block is left alone. That block
- * is whatever Gmail's web composer wrote, or whatever the user edited it into,
- * and replacing it with the account default would discard a deliberate change
- * the same way an unguarded draft edit would.
+ * A quoted earlier message belongs to someone else and often carries its own
+ * signature block. That block says nothing about whether this message is signed,
+ * and must never be edited, so every signature decision is made on the runs
+ * outside quotes only. An unclosed blockquote is treated as quoting to the end.
+ */
+function splitQuoted(html: string): Array<{ text: string; quoted: boolean }> {
+ const runs: Array<{ text: string; quoted: boolean }> = [];
+ const tag = /<blockquote\b[^>]*>|<\/blockquote\s*>/gi;
+ let depth = 0;
+ let last = 0;
+ let quoteStart = 0;
+ let match: RegExpExecArray | null;
+
+ while ((match = tag.exec(html)) !== null) {
+  if (match[0][1] !== '/') {
+   if (depth === 0) {
+    runs.push({ text: html.slice(last, match.index), quoted: false });
+    quoteStart = match.index;
+   }
+   depth += 1;
+  } else if (depth > 0) {
+   depth -= 1;
+   if (depth === 0) {
+    runs.push({ text: html.slice(quoteStart, tag.lastIndex), quoted: true });
+    last = tag.lastIndex;
+   }
+  }
+ }
+
+ if (depth > 0) runs.push({ text: html.slice(quoteStart), quoted: true });
+ else runs.push({ text: html.slice(last), quoted: false });
+ return runs;
+}
+
+/** One signature container per `class="... gmail_signature ..."`; the separator span's class is a different word. */
+function countSignatureBlocks(html: string): number {
+ const own = new RegExp(`\\bclass\\s*=\\s*["'][^"']*\\b${SIGNATURE_MARKER}\\b`, 'gi');
+ return (html.match(own) ?? []).length;
+}
+
+/**
+ * Append the signature to an HTML body, exactly once, in Gmail's own form.
+ *
+ * A body already carrying exactly one signature block outside any quoted reply
+ * is left alone. That block is whatever Gmail's web composer wrote, or whatever
+ * the user edited it into, and replacing it with the account default would
+ * discard a deliberate change the same way an unguarded draft edit would. A
+ * signature inside a quoted earlier message does not count: it is the other
+ * party's, and this message still needs its own.
  *
  * With no block present, any raw inlined copy is removed first so a caller who
  * pasted the signature markup into the body does not get a second one. More than
@@ -129,17 +174,21 @@ function appendTextSignature(body: string, signature?: SignatureParts | null): s
 function appendHtmlSignature(html: string, signature?: SignatureParts | null): string {
  if (!signature || !signature.html) return html;
 
- const blocks = html.split(SIGNATURE_MARKER).length - 1;
- // Two occurrences per block: the class and the data-smartmail attribute.
- if (blocks === 2) return html;
+ const runs = splitQuoted(html);
+ const ownText = runs.filter(r => !r.quoted).map(r => r.text).join('');
+ if (countSignatureBlocks(ownText) === 1) return html;
 
  const wrapped = wrapSignatureHtml(signature.html);
- const stripped = html
-  .split(wrapped)
-  .join('')
-  .split(signature.html)
+ // Earlier builds emitted a bare container with no separator; their copies are
+ // removed the same way so an edited draft ends with one block, not two.
+ const legacy = `<div class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}">${signature.html}</div>`;
+ const stripped = runs
+  .map(r => (r.quoted
+   ? r.text
+   : r.text.split(wrapped).join('').split(legacy).join('').split(signature.html).join('')))
   .join('')
   .replace(/(?:\s*<div><br><\/div>)+\s*$/, '')
+  .replace(/\s*<span class="gmail_signature_prefix">-- <\/span><br>\s*$/, '')
   .replace(/\s+$/, '');
 
  if (stripped.trim() === '') return wrapped;
