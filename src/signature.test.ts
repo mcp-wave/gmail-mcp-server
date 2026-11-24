@@ -46,10 +46,17 @@ function stubGmail(options: StubOptions = {}) {
 }
 
 describe('wrapSignatureHtml', () => {
- it('wraps the HTML fragment in Gmail canonical signature container', () => {
+ it('writes the "-- " separator and the container exactly as Gmail composes them', () => {
   const wrapped = wrapSignatureHtml('<p>Best regards,<br>Alice</p>');
   expect(wrapped).toBe(
-   `<div class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}"><p>Best regards,<br>Alice</p></div>`,
+   `<span class="${SIGNATURE_MARKER}_prefix">-- </span><br><div dir="ltr" class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}"><p>Best regards,<br>Alice</p></div>`,
+  );
+ });
+
+ it('does not add a second separator when the signature opens with its own', () => {
+  const wrapped = wrapSignatureHtml('<div>-- <br>Alice</div>');
+  expect(wrapped).toBe(
+   `<div dir="ltr" class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}"><div>-- <br>Alice</div></div>`,
   );
  });
 });

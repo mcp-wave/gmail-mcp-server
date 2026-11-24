@@ -34,12 +34,24 @@ export type SignatureResolution =
 export const SIGNATURE_MARKER = 'gmail_signature';
 
 /**
- * Wraps an HTML signature fragment in Gmail's canonical signature container.
- * Gmail web uses this class and attribute so the recipient's webmail can
- * identify, style, or collapse the signature block automatically.
+ * True when the signature already opens with its own "--" separator line, in
+ * which case Gmail's separator must not be emitted a second time.
+ */
+function startsWithSeparator(html: string): boolean {
+ return /^\s*(?:<[^>]*>\s*)*--(?:\s|&nbsp;|<br)/i.test(html);
+}
+
+/**
+ * Wraps an HTML signature fragment exactly as Gmail's web composer writes it:
+ * the "-- " separator span and line break, then the signature in a
+ * `gmail_signature` container. The class and attribute are how the recipient's
+ * webmail identifies, styles, or collapses the block.
  */
 export function wrapSignatureHtml(html: string): string {
- return `<div class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}">${html}</div>`;
+ const separator = startsWithSeparator(html)
+  ? ''
+  : `<span class="${SIGNATURE_MARKER}_prefix">-- </span><br>`;
+ return `${separator}<div dir="ltr" class="${SIGNATURE_MARKER}" data-smartmail="${SIGNATURE_MARKER}">${html}</div>`;
 }
 
 /**
